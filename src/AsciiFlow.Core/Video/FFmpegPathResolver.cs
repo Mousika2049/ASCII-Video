@@ -87,7 +87,7 @@ public static class FFmpegPathResolver
     }
 
     /// <summary>
-    /// 向上查找项目根目录（包含 .git 或 .sln 的目录），最多向上 5 层
+    /// 向上查找项目根目录（包含 .git、.sln 或 .slnx 的目录）
     /// </summary>
     private static string? FindProjectRootFromAppDir()
     {
@@ -95,11 +95,12 @@ public static class FFmpegPathResolver
         {
             var dir = new DirectoryInfo(AppContext.BaseDirectory);
 
-            // 最多向上查找 5 层（覆盖 bin/Debug/net10.0 → 项目根目录）
-            for (int i = 0; i < 5 && dir != null; i++, dir = dir.Parent)
+            // 覆盖 src/AsciiFlow.App/bin/Release/net10.0 → 项目根目录
+            for (int i = 0; i < 8 && dir != null; i++, dir = dir.Parent)
             {
                 bool hasGit = Directory.Exists(Path.Combine(dir.FullName, ".git"));
-                bool hasSln = Directory.GetFiles(dir.FullName, "*.sln", SearchOption.TopDirectoryOnly).Length > 0;
+                bool hasSln = Directory.GetFiles(dir.FullName, "*.sln", SearchOption.TopDirectoryOnly).Length > 0 ||
+                              Directory.GetFiles(dir.FullName, "*.slnx", SearchOption.TopDirectoryOnly).Length > 0;
                 if (hasGit || hasSln) return dir.FullName;
             }
         }
@@ -122,14 +123,17 @@ public static class FFmpegPathResolver
         {
             // 根据操作系统检查关键 DLL/SO 文件
             string[] markers = RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
-                ? new[] { "avcodec-*.dll", "avformat-*.dll", "avutil-*.dll" }
-                : new[] { "libavcodec.so*", "libavformat.so*", "libavutil.so*" };
+                ? ["avcodec-*.dll", "avformat-*.dll", "avutil-*.dll", "swscale-*.dll"]
+                : RuntimeInformation.IsOSPlatform(OSPlatform.OSX)
+                    ? ["libavcodec*.dylib", "libavformat*.dylib", "libavutil*.dylib", "libswscale*.dylib"]
+                    : ["libavcodec.so*", "libavformat.so*", "libavutil.so*", "libswscale.so*"];
 
             foreach (string pattern in markers)
             {
-                if (Directory.GetFiles(path, pattern).Length > 0)
-                    return true;
+                if (Directory.GetFiles(path, pattern).Length == 0)
+                    return false;
             }
+            return true;
         }
         catch
         {
@@ -160,12 +164,12 @@ public static class FFmpegPathResolver
 │    AsciiFlow/                                                  │
 │    └── ffmpeg/                                                 │
 │        └── {(RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? "windows/" : RuntimeInformation.IsOSPlatform(OSPlatform.OSX) ? "macos/  " : "linux/   ")}                                         │
-│            ├─ {(RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? "avcodec-61.dll" : "libavcodec.so.*",-50)} │
-│            ├─ {(RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? "avformat-61.dll" : "libavformat.so.*",-50)} │
+│            ├─ {(RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? "avcodec-62.dll" : "libavcodec.so.*"),-50} │
+│            ├─ {(RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? "avformat-62.dll" : "libavformat.so.*"),-50} │
 │            └─ ...                                              │
 │                                                                │
 │  解决方式:                                                      │
-│    1. 将 FFmpeg 库文件放入项目根目录下的 ffmpeg/{(RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? "windows" : "linux")}/ 文件夹 │
+│    1. 将 FFmpeg 库文件放入项目根目录下的 ffmpeg/{(RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? "windows" : RuntimeInformation.IsOSPlatform(OSPlatform.OSX) ? "macos" : "linux")}/ 文件夹 │
 │    2. 设置环境变量 FFMPEG_ROOT=/path/to/ffmpeg                 │
 │    3. 将 FFmpeg 库所在目录加入系统 PATH                        │
 │                                                                │

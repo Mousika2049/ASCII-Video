@@ -1,7 +1,7 @@
 # 🌊 AsciiFlow - 高性能全彩 ASCII 视频转换器
 
 <p align="center">
-  <b>基于 .NET 10 & FFmpeg & SkiaSharp 的工业级全彩字符视频处理引擎</b>
+  <b>基于 .NET 10、FFmpeg 与 SkiaSharp 的全彩字符视频处理工具</b>
 </p>
 
 ---
@@ -9,17 +9,19 @@
 ## ✨ 核心特性
 
 - 🎨 **原视频全彩渲染（Color ASCII）**
-  支持字符级 RGB 色彩采样与透明度 Alpha 遮罩混合，完美还原原视频的丰富色彩。
+  支持字符级 RGB 色彩采样与 Alpha 遮罩混合，在保留 ASCII 风格的同时还原主要色彩。
 - 👁️ **人眼感知最佳灰度映射（BT.709 + S-Curve）**
   遵循 ITU-R BT.709 亮度标准，结合 S 曲线 (S-Curve) 伽马对比度增强，明暗细节清晰，高对比度不失真。
 - 🎵 **原声音频无损透传（Audio Stream Copy）**
-  基于 FFmpeg 流复用（Remuxing）技术，将原视频音轨无损复制并自动挂载至输出 MP4 容器，零音质损耗，音画完全同步。
-- ⚡ **极致处理性能（80+ FPS @ 1080p）**
-  采用底层 C# `unsafe` 内存指针、行级 `Parallel.For` 多线程并行计算与预渲染字符位图缓存，无高频 GC 内存分配。
+  基于 FFmpeg 流复用（Remuxing）技术，在音频编码与 MP4 容器兼容时复制原始音频包。
+- ⚡ **低分配处理流水线**
+  复用解码、灰度、字符、颜色和渲染缓冲区，并通过行级 `Parallel.For` 与预渲染字符缓存减少逐帧开销。
 - 🐧 **全平台字体兼容（Cross-Platform Font Fallback）**
   内置 Windows / Linux / macOS 自动字体选择降级机制（Consolas ➔ Cascadia Mono ➔ DejaVu Sans Mono ➔ Liberation Mono ➔ Monospace），防止跨平台全黑画面。
 - ⏱️ **智能帧率匹配（Auto Frame Rate）**
-  默认自动检测并继承原视频的实际帧率（如 24 / 25 / 30 / 60 FPS），确保输出视频播放流畅。
+  使用有理数保留 `30000/1001`、`24000/1001` 等小数帧率，避免整数截断造成的累计漂移。
+- 🛡️ **安全输出**
+  先写入同目录临时文件，成功完成容器尾部后再替换目标；失败或取消不会破坏旧输出。
 
 ---
 
@@ -28,7 +30,7 @@
 ```mermaid
 flowchart LR
     A[📹 输入视频] --> B[1. FFmpeg 解码 RGB24]
-    B --> C[2. SIMD/并行 灰度转换]
+    B --> C[2. 并行灰度转换]
     C --> D[3. S-Curve ASCII & 颜色映射]
     D --> E[4. SkiaSharp 字符多线程渲染]
     E --> F[5. H.264 编码 + 音轨透传]
@@ -51,6 +53,9 @@ cd AsciiFlow
 
 # 编译项目
 dotnet build AsciiFlow.slnx -c Release
+
+# 运行单元测试
+dotnet test AsciiFlow.slnx -c Release
 ```
 
 ### 基础使用
@@ -81,26 +86,18 @@ dotnet run --project src/AsciiFlow.App -- -i input.mp4 -o output.mp4 --max-frame
 | `-h` | `--height` | `0` (自动) | ASCII 字符画高度（`0` 表示根据原视频比例自动计算，16:9 对应 `135`） |
 | `-f` | `--framerate` | `0.0` (自动) | 输出视频帧率（`0` 表示自动与原视频一致） |
 | `-C` | `--color` | `true` | 是否启用彩色模式 (`true` / `false`) |
-| `-c` | `--charset` | `standard` | 字符集选用：`standard`(69字符) 或 `detailed`(25字符) |
-| `-f` | `--font-family` | `Consolas` | 渲染字体族名称（跨平台自动回退） |
-| `-s` | `--font-size` | `12` | 渲染字体大小 (px) |
-| `-m` | `--max-frames` | `0` | 最大转换帧数（`0` 表示转换全片） |
+| `-c` | `--charset` | `standard` | 字符集选用：`standard`（70 字符）或 `detailed`（16 字符） |
+| | `--font-family` | `Consolas` | 渲染字体族名称（跨平台自动回退） |
+| | `--font-size` | `12` | 渲染字体大小 (px) |
+| | `--max-frames` | `0` | 最大转换帧数（`0` 表示转换全片） |
 | | `--no-progress` | `false` | 禁用控制台进度条显示 |
+| `-v` | `--verbose` | `false` | 显示详细错误和 FFmpeg 日志 |
 
 ---
 
-## 📊 性能表现
+## 📊 性能测量
 
-在 Linux 1080p 视频转 ASCII 视频的测试报告：
-
-| 处理阶段 | 单帧平均耗时 | 耗时占比 | 优化技术 |
-| :--- | :--- | :--- | :--- |
-| **视频解码 (FFmpeg)** | 3.22 ms | 26.1% | 循环帧缓冲 + 原生硬件 API |
-| **灰度转换 (BT.709)** | 1.24 ms | 10.1% | `unsafe` 指针 + `Parallel.For` 并行 |
-| **ASCII/颜色映射** | 1.68 ms | 13.6% | $O(1)$ 查找表 + S-Curve 梯度 |
-| **字符渲染 (SkiaSharp)** | 1.54 ms | 12.5% | 预渲染字符遮罩 + 多线程 Alpha 混合 |
-| **视频编码 (H.264)** | 4.64 ms | 37.7% | libx264 快速容器封包 + 音轨透传 |
-| **🚀 综合评估** | **12.32 ms / 帧** | **100%** | **单机处理速度 81.2 FPS** |
+程序会在每次转换后输出解码、灰度转换、映射、渲染和编码的实际耗时。结果取决于源编码、分辨率、ASCII 网格、字体、CPU 和 FFmpeg 构建，请在目标机器上使用同一输入进行比较，不把单台机器的结果视为通用保证。
 
 ---
 
@@ -112,10 +109,12 @@ AsciiFlow/
 │   ├── AsciiFlow.App/             # 命令行应用层 (CLI & Pipeline Orchestration)
 │   └── AsciiFlow.Core/            # 核心领域逻辑库
 │       ├── Video/                 # FFmpeg 解码器与音轨处理
-│       ├── Processing/            # SIMD & 多线程灰度转换
+│       ├── Processing/            # 并行灰度转换
 │       ├── AsciiMapping/          # 灰度到 ASCII 字符与颜色映射器
 │       ├── Rendering/             # SkiaSharp 字符位图渲染引擎
 │       └── Encoding/              # FFmpeg H.264 编码器
+├── tests/
+│   └── AsciiFlow.Core.Tests/      # 映射、渲染、灰度和帧率测试
 ├── ffmpeg/                        # FFmpeg 原生动态库
 ├── output/                        # 默认输出目录
 └── README.md                      # 项目说明文档

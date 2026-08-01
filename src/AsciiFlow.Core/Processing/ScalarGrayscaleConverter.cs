@@ -23,13 +23,13 @@ public class ScalarGrayscaleConverter : IGrayscaleConverter
         if (width <= 0 || height <= 0)
             throw new ArgumentException($"Width 和 height 必须是正数");
 
-        int expectedLength = width * height * 3;
+        int pixelCount = checked(width * height);
+        int expectedLength = checked(pixelCount * 3);
         if (rgbData.Length != expectedLength)
             throw new ArgumentException(
                 $"RGB 数据长度不匹配，期望 {expectedLength}，实际 {rgbData.Length}");
 
-        byte[] grayData = new byte[width * height];
-        int pixelCount = width * height;
+        byte[] grayData = new byte[pixelCount];
 
         for (int i = 0; i < pixelCount; i++)
         {

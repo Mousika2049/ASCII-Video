@@ -45,7 +45,7 @@ public class FFmpegDecoderException : Exception
     /// <summary>
     /// 构造函数（完整）
     /// </summary>
-    public FFmpegDecoderException(string message, int errorCode, Exception? innerException = null) 
+    public FFmpegDecoderException(string message, int errorCode, Exception? innerException = null)
         : base(message, innerException)
     {
         ErrorCode = errorCode;

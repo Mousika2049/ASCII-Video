@@ -1,3 +1,5 @@
+using AsciiFlow.Core.AsciiMapping;
+
 namespace AsciiFlow.Core.Rendering;
 
 /// <summary>
@@ -22,6 +24,9 @@ public interface IAsciiRenderer : IDisposable
     /// 初始化渲染器（预渲染字符缓存）
     /// </summary>
     void Initialize();
+
+    /// <summary>直接渲染结构化的映射结果，避免逐帧字符串分配。</summary>
+    byte[] RenderFrame(AsciiFrame frame, bool useColor = true);
 
     /// <summary>
     /// 将 ASCII 字符串渲染为 RGB24 字节数组

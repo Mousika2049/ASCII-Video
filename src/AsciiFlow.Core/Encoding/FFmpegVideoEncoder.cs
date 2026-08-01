@@ -1,8 +1,7 @@
 using System;
 using System.IO;
 using System.Runtime.CompilerServices;
-using System.Runtime.InteropServices;
-using System.Text;
+using AsciiFlow.Core.Video;
 using FFmpeg.AutoGen;
 
 namespace AsciiFlow.Core.Encoding;
@@ -27,6 +26,7 @@ public unsafe class FFmpegVideoEncoder : IVideoEncoder
     private int _width;
     private int _height;
     private double _frameRate;
+    private VideoFrameRate _exactFrameRate;
     private long _encodedFrames;
     private bool _initialized;
     private bool _disposed;
@@ -35,7 +35,6 @@ public unsafe class FFmpegVideoEncoder : IVideoEncoder
     // FFmpeg 错误码常量
     private const int AVERROR_EAGAIN = -11;
     private static readonly int AVERROR_EOF = ffmpeg.AVERROR_EOF;
-    private const int AV_TIME_BASE = 1000000;
 
     // 编码器配置
     private const string CodecName = "libx264";
@@ -59,7 +58,6 @@ public unsafe class FFmpegVideoEncoder : IVideoEncoder
 
     public FFmpegVideoEncoder()
     {
-        FFmpeg.AutoGen.ffmpeg.av_log_set_level(FFmpeg.AutoGen.ffmpeg.AV_LOG_QUIET);
         // Ensure non-nullable fields are initialized to satisfy the compiler
         _outputPath = string.Empty;
     }
@@ -69,15 +67,20 @@ public unsafe class FFmpegVideoEncoder : IVideoEncoder
     /// <summary>
     /// 初始化编码器（IVideoEncoder 接口实现）
     /// </summary>
-    public void Initialize(string outputPath, int width, int height, double frameRate = 30.0)
+    public void Initialize(string outputPath, int width, int height, VideoFrameRate frameRate)
     {
         Initialize(outputPath, width, height, frameRate, null);
+    }
+
+    public void Initialize(string outputPath, int width, int height, double frameRate = 30.0)
+    {
+        Initialize(outputPath, width, height, VideoFrameRate.FromDouble(frameRate), null);
     }
 
     /// <summary>
     /// 初始化编码器（支持挂载原视频音频轨）
     /// </summary>
-    public void Initialize(string outputPath, int width, int height, double frameRate, AVStream* inAudioStream)
+    public void Initialize(string outputPath, int width, int height, VideoFrameRate frameRate, AVStream* inAudioStream)
     {
         if (_initialized)
             throw new InvalidOperationException("编码器已初始化");
@@ -88,10 +91,18 @@ public unsafe class FFmpegVideoEncoder : IVideoEncoder
         if (width <= 0 || height <= 0)
             throw new ArgumentOutOfRangeException($"尺寸不合法: {width}x{height}");
 
+        if ((width & 1) != 0 || (height & 1) != 0)
+            throw new ArgumentException($"H.264 YUV420P 输出尺寸必须为偶数: {width}x{height}");
+
+        if (!frameRate.IsValid)
+            throw new ArgumentOutOfRangeException(nameof(frameRate), "帧率必须为正数");
+
         _outputPath = outputPath;
+        _audioStreamIndex = -1;
         _width = width;
         _height = height;
-        _frameRate = frameRate;
+        _exactFrameRate = frameRate.Reduce();
+        _frameRate = _exactFrameRate.Value;
 
         try
         {
@@ -107,8 +118,11 @@ public unsafe class FFmpegVideoEncoder : IVideoEncoder
                 AVStream* outAudioStream = ffmpeg.avformat_new_stream(_formatContext, null);
                 if (outAudioStream != null)
                 {
-                    ffmpeg.avcodec_parameters_copy(outAudioStream->codecpar, inAudioStream->codecpar);
+                    int copyRet = ffmpeg.avcodec_parameters_copy(outAudioStream->codecpar, inAudioStream->codecpar);
+                    if (copyRet < 0)
+                        throw new FFmpegEncoderException("无法复制音频流参数", copyRet);
                     outAudioStream->codecpar->codec_tag = 0;
+                    outAudioStream->time_base = inAudioStream->time_base;
                     _audioStreamIndex = outAudioStream->index;
                     Console.WriteLine($"[编码器] ✓ 挂载原音频轨 (Stream #{_audioStreamIndex})");
                 }
@@ -129,7 +143,7 @@ public unsafe class FFmpegVideoEncoder : IVideoEncoder
             _encodedFrames = 0;
 
             Console.WriteLine($"[编码器] 初始化完成: {outputPath}");
-            Console.WriteLine($"[编码器] 分辨率: {width}x{height}, 帧率: {frameRate:F2} fps");
+            Console.WriteLine($"[编码器] 分辨率: {width}x{height}, 帧率: {_frameRate:F3} fps ({_exactFrameRate})");
             Console.WriteLine($"[编码器] 编码: {CodecName}, CRF: {DefaultCRF}, 预设: {DefaultPreset}");
         }
         catch (Exception ex)
@@ -156,13 +170,17 @@ public unsafe class FFmpegVideoEncoder : IVideoEncoder
         outPacket->stream_index = _audioStreamIndex;
         outPacket->pos = -1;
 
-        if (outPacket->pts != ffmpeg.AV_NOPTS_VALUE)
+        try
         {
             ffmpeg.av_packet_rescale_ts(outPacket, inAudioStream->time_base, outAudioStream->time_base);
+            int writeRet = ffmpeg.av_interleaved_write_frame(_formatContext, outPacket);
+            if (writeRet < 0)
+                throw new FFmpegEncoderException("写入音频包失败", writeRet);
         }
-
-        ffmpeg.av_interleaved_write_frame(_formatContext, outPacket);
-        ffmpeg.av_packet_free(&outPacket);
+        finally
+        {
+            ffmpeg.av_packet_free(&outPacket);
+        }
     }
 
     /// <summary>
@@ -221,13 +239,20 @@ public unsafe class FFmpegVideoEncoder : IVideoEncoder
         _codecContext->width = _width;
         _codecContext->height = _height;
         _codecContext->pix_fmt = AVPixelFormat.AV_PIX_FMT_YUV420P;
-        _codecContext->time_base = new AVRational { num = 1, den = (int)_frameRate };
-        _codecContext->framerate = new AVRational { num = (int)_frameRate, den = 1 };
+        _codecContext->framerate = new AVRational
+        {
+            num = _exactFrameRate.Numerator,
+            den = _exactFrameRate.Denominator
+        };
+        _codecContext->time_base = ffmpeg.av_inv_q(_codecContext->framerate);
 
         // GOP 结构：每 2 秒一个关键帧
         _codecContext->gop_size = (int)(_frameRate * 2);
         _codecContext->max_b_frames = 2;
         _codecContext->bit_rate = 4_000_000;  // 4 Mbps 基础码率
+
+        if ((_formatContext->oformat->flags & ffmpeg.AVFMT_GLOBALHEADER) != 0)
+            _codecContext->flags |= ffmpeg.AV_CODEC_FLAG_GLOBAL_HEADER;
 
         // 设置 H.264 特定选项（CRF + 预设）
         AVDictionary* options = null;
@@ -447,7 +472,9 @@ public unsafe class FFmpegVideoEncoder : IVideoEncoder
         {
             // 1. 刷新编码器（发送 null 帧表示结束）
             int flushRet = ffmpeg.avcodec_send_frame(_codecContext, null);
-            
+            if (flushRet < 0 && flushRet != AVERROR_EOF)
+                throw new FFmpegEncoderException("刷新视频编码器失败", flushRet);
+
             // 尝试接收 flush 出的包（EOF 是正常的）
             ReceiveAndWritePackets();
 
@@ -463,11 +490,6 @@ public unsafe class FFmpegVideoEncoder : IVideoEncoder
                 double fileSizeMB = file.Length / (1024.0 * 1024.0);
                 Console.WriteLine($"[编码器] 输出文件: {_outputPath} ({fileSizeMB:F2} MB)");
             }
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"[编码器错误] Finish 失败: {ex.Message}");
-            // 即使出错也要清理资源
         }
         finally
         {

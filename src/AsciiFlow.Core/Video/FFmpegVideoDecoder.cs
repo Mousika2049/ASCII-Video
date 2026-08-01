@@ -1,7 +1,6 @@
 using System;
 using System.IO;
 using System.Runtime.InteropServices;
-using System.Text;
 using FFmpeg.AutoGen;
 
 namespace AsciiFlow.Core.Video;
@@ -22,6 +21,7 @@ public unsafe class FFmpegVideoDecoder : IVideoDecoder
     private int _width;
     private int _height;
     private double _frameRate;
+    private VideoFrameRate _exactFrameRate;
     private long _frameCount;
     private long _currentFrame;
     private bool _initialized;
@@ -32,9 +32,10 @@ public unsafe class FFmpegVideoDecoder : IVideoDecoder
 
     // flush 模式标志（用于处理 H.264 解码延迟）
     private bool _inFlushMode = false;
+    private bool _packetPending;
 
     // FFmpeg 错误码常量
-    private const int AVERROR_EOF = unchecked((int)0x20464F45);
+    private static readonly int AVERROR_EOF = ffmpeg.AVERROR_EOF;
     private const int AVERROR_EAGAIN = -11;
     private const long AV_TIME_BASE = 1000000;
 
@@ -117,10 +118,13 @@ public unsafe class FFmpegVideoDecoder : IVideoDecoder
             _height = _codecContext->height;
 
             // 获取帧率
-            if (videoStream->avg_frame_rate.den > 0)
-                _frameRate = (double)videoStream->avg_frame_rate.num / videoStream->avg_frame_rate.den;
-            else
-                _frameRate = 30.0;
+            AVRational detectedRate = videoStream->avg_frame_rate.den > 0 && videoStream->avg_frame_rate.num > 0
+                ? videoStream->avg_frame_rate
+                : videoStream->r_frame_rate;
+            _exactFrameRate = detectedRate.den > 0 && detectedRate.num > 0
+                ? new VideoFrameRate(detectedRate.num, detectedRate.den).Reduce()
+                : new VideoFrameRate(30, 1);
+            _frameRate = _exactFrameRate.Value;
 
             // 获取总帧数
             if (videoStream->nb_frames > 0)
@@ -221,42 +225,61 @@ public unsafe class FFmpegVideoDecoder : IVideoDecoder
             while (true)
             {
                 // ① 首先尝试从解码器接收一帧（可能之前 send 的包已经产出帧）
-                byte[]? existing = TryReceiveFrame();
+                byte[]? existing = TryReceiveFrame(out bool decoderEof);
                 if (existing != null)
                     return existing;
+
+                if (decoderEof)
+                    return null;
 
                 // ② 如果已进入 flush 模式（EOF 后），继续 flush 直到无帧
                 if (_inFlushMode)
                 {
-                    int flushRet = ffmpeg.avcodec_send_packet(_codecContext, null);
-
-                    byte[]? flushFrame = TryReceiveFrame();
-                    if (flushFrame != null)
-                        return flushFrame;
-
-                    // 真正的 EOF，彻底结束
                     return null;
+                }
+
+                if (_packetPending)
+                {
+                    int pendingRet = ffmpeg.avcodec_send_packet(_codecContext, _packet);
+                    if (pendingRet == AVERROR_EAGAIN)
+                        throw new FFmpegDecoderException("解码器同时拒绝发送和接收数据", pendingRet);
+
+                    ffmpeg.av_packet_unref(_packet);
+                    _packetPending = false;
+
+                    if (pendingRet < 0)
+                        throw new FFmpegDecoderException("重新发送数据包到解码器失败", pendingRet);
+
+                    continue;
                 }
 
                 // ③ 从容器读取下一个包
                 int readRet = ffmpeg.av_read_frame(_formatContext, _packet);
 
-                if (readRet < 0)
+                if (readRet == AVERROR_EOF)
                 {
-                    // 容器 EOF 或读取出错 → 进入 flush 模式
                     _inFlushMode = true;
-                    ffmpeg.avcodec_send_packet(_codecContext, null);
+                    int flushRet = ffmpeg.avcodec_send_packet(_codecContext, null);
+                    if (flushRet < 0 && flushRet != AVERROR_EOF)
+                        throw new FFmpegDecoderException("刷新视频解码器失败", flushRet);
                     continue;
                 }
+
+                if (readRet < 0)
+                    throw new FFmpegDecoderException("读取媒体数据包失败", readRet);
 
                 // ④ 处理音频包：将原音频数据包透传通知
                 if (_packet->stream_index == _audioStreamIndex)
                 {
-                    if (_formatContext != null && _audioStreamIndex >= 0)
+                    try
                     {
-                        OnAudioPacket?.Invoke(_packet, _formatContext->streams[_audioStreamIndex]);
+                        if (_formatContext != null && _audioStreamIndex >= 0)
+                            OnAudioPacket?.Invoke(_packet, _formatContext->streams[_audioStreamIndex]);
                     }
-                    ffmpeg.av_packet_unref(_packet);
+                    finally
+                    {
+                        ffmpeg.av_packet_unref(_packet);
+                    }
                     continue;
                 }
 
@@ -269,13 +292,15 @@ public unsafe class FFmpegVideoDecoder : IVideoDecoder
 
                 // ⑤ 发送视频包到解码器
                 int sendRet = ffmpeg.avcodec_send_packet(_codecContext, _packet);
-                ffmpeg.av_packet_unref(_packet);
 
                 // EAGAIN：解码器缓冲区满，需要先接收帧才能继续发送
                 if (sendRet == AVERROR_EAGAIN)
                 {
+                    _packetPending = true;
                     continue;
                 }
+
+                ffmpeg.av_packet_unref(_packet);
 
                 // 其他错误
                 if (sendRet < 0)
@@ -291,8 +316,9 @@ public unsafe class FFmpegVideoDecoder : IVideoDecoder
         }
     }
 
-    private byte[]? TryReceiveFrame()
+    private byte[]? TryReceiveFrame(out bool decoderEof)
     {
+        decoderEof = false;
         if (_frame == null || _frameBuffer == null)
             return null;
 
@@ -303,8 +329,14 @@ public unsafe class FFmpegVideoDecoder : IVideoDecoder
             return null;
 
         // 真正的 EOF 或错误
-        if (receiveRet == AVERROR_EOF || receiveRet < 0)
+        if (receiveRet == AVERROR_EOF)
+        {
+            decoderEof = true;
             return null;
+        }
+
+        if (receiveRet < 0)
+            throw new FFmpegDecoderException("从解码器接收视频帧失败", receiveRet);
 
         // 成功收到一帧，转换像素格式
         CopyFrameToBuffer();
@@ -354,7 +386,13 @@ public unsafe class FFmpegVideoDecoder : IVideoDecoder
 
         try
         {
-            long timestamp = (long)((frameNumber / _frameRate) * AV_TIME_BASE);
+            AVStream* videoStream = _formatContext->streams[_streamIndex];
+            AVRational frameTimeBase = new()
+            {
+                num = _exactFrameRate.Denominator,
+                den = _exactFrameRate.Numerator
+            };
+            long timestamp = ffmpeg.av_rescale_q(frameNumber, frameTimeBase, videoStream->time_base);
             int seekRet = ffmpeg.av_seek_frame(
                 _formatContext, _streamIndex,
                 timestamp, ffmpeg.AVSEEK_FLAG_BACKWARD);
@@ -363,6 +401,12 @@ public unsafe class FFmpegVideoDecoder : IVideoDecoder
                 throw new FFmpegDecoderException($"跳转到帧 {frameNumber} 失败", seekRet);
 
             ffmpeg.avcodec_flush_buffers(_codecContext);
+
+            if (_packetPending)
+            {
+                ffmpeg.av_packet_unref(_packet);
+                _packetPending = false;
+            }
 
             _currentFrame = frameNumber;
             _inFlushMode = false;   // 重置 flush 模式
@@ -386,7 +430,7 @@ public unsafe class FFmpegVideoDecoder : IVideoDecoder
             ? ffmpeg.av_get_pix_fmt_name(_codecContext->pix_fmt).ToString()
             : "unknown";
 
-        return new VideoInfo(_width, _height, _frameRate, _frameCount, codecName, pixelFormat);
+        return new VideoInfo(_width, _height, _exactFrameRate, _frameCount, codecName, pixelFormat);
     }
 
     public void Reset()
@@ -438,6 +482,7 @@ public unsafe class FFmpegVideoDecoder : IVideoDecoder
 
         _initialized = false;
         _inFlushMode = false;
+        _packetPending = false;
     }
 
     public void Dispose()
@@ -449,9 +494,9 @@ public unsafe class FFmpegVideoDecoder : IVideoDecoder
     protected virtual void Dispose(bool disposing)
     {
         if (_disposed) return;
+        Cleanup();
         if (disposing)
         {
-            Cleanup();
             _frameBuffer = null;
             _videoPath = null;
         }

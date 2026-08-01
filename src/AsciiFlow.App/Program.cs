@@ -1,10 +1,9 @@
 using System;
 using System.Diagnostics;
 using System.IO;
-using System.Runtime.InteropServices;
-using FFmpeg.AutoGen;
 using CommandLine;
 using AsciiFlow.App.Core;
+using AsciiFlow.Core.Video;
 
 namespace AsciiFlow.App;
 
@@ -14,19 +13,27 @@ namespace AsciiFlow.App;
 /// </summary>
 class Program
 {
-    static async Task<int> Main(string[] args)
+    static int Main(string[] args)
     {
-        // ======================================================
-        // 🔑 关键：在任何 FFmpeg API 调用之前必须设置路径
-        // ======================================================
-        SetupFFmpegRootPath();
-        // ======================================================
+        using var cancellationSource = new CancellationTokenSource();
+        ConsoleCancelEventHandler cancelHandler = (_, eventArgs) =>
+        {
+            eventArgs.Cancel = true;
+            cancellationSource.Cancel();
+        };
+        Console.CancelKeyPress += cancelHandler;
 
-        // 解析命令行参数
-        return await Parser.Default.ParseArguments<CommandLineOptions>(args)
-            .MapResult(
-                async opts => await RunAsync(opts),
-                errs => Task.FromResult(1));
+        try
+        {
+            return Parser.Default.ParseArguments<CommandLineOptions>(args)
+                .MapResult(
+                    opts => Run(opts, cancellationSource.Token),
+                    _ => 2);
+        }
+        finally
+        {
+            Console.CancelKeyPress -= cancelHandler;
+        }
     }
 
     /// <summary>
@@ -36,7 +43,7 @@ class Program
     {
         try
         {
-            string? resolvedPath = ResolveFFmpegPath();
+            string? resolvedPath = FFmpegPathResolver.Resolve();
 
             if (resolvedPath != null)
             {
@@ -47,7 +54,7 @@ class Program
             {
                 // 未找到路径 —— 显示详细帮助
                 Console.ForegroundColor = ConsoleColor.Yellow;
-                Console.WriteLine(GetFFmpegHelpMessage());
+                Console.WriteLine(FFmpegPathResolver.GetHelpMessage());
                 Console.ResetColor();
             }
         }
@@ -60,160 +67,16 @@ class Program
     }
 
     /// <summary>
-    /// 按优先级查找 FFmpeg 库路径
-    /// 
-    /// 优先级：
-    /// 1. FFMPEG_ROOT 环境变量
-    /// 2. 应用所在目录的 ffmpeg/{platform}/ 子目录（发布场景）
-    /// 3. 项目根目录的 ffmpeg/{platform}/ 子目录（dotnet run 场景）
-    /// 4. 当前工作目录的 ffmpeg/{platform}/ 子目录（备用）
-    /// </summary>
-    private static string? ResolveFFmpegPath()
-    {
-        // 1. 环境变量
-        string? envPath = Environment.GetEnvironmentVariable("FFMPEG_ROOT");
-        if (!string.IsNullOrEmpty(envPath) && Directory.Exists(envPath))
-            return envPath;
-
-        // 2. 应用目录下的 ffmpeg/{platform}/
-        string appDir = AppContext.BaseDirectory;
-        string? appPath = GetPlatformSpecificPath(appDir);
-        if (appPath != null && Directory.Exists(appPath) && HasFFmpegDlls(appPath))
-            return appPath;
-
-        // 3. 项目根目录下的 ffmpeg/{platform}/（向上查找 .sln 或 .git）
-        string? projectRoot = FindProjectRoot();
-        if (projectRoot != null)
-        {
-            string? projPath = GetPlatformSpecificPath(projectRoot);
-            if (projPath != null && Directory.Exists(projPath) && HasFFmpegDlls(projPath))
-                return projPath;
-        }
-
-        // 4. 当前工作目录
-        try
-        {
-            string cwd = Directory.GetCurrentDirectory();
-            string? cwdPath = GetPlatformSpecificPath(cwd);
-            if (cwdPath != null && Directory.Exists(cwdPath) && HasFFmpegDlls(cwdPath))
-                return cwdPath;
-        }
-        catch { /* 忽略权限错误 */ }
-
-        return null;
-    }
-
-    /// <summary>
-    /// 根据当前操作系统返回对应的平台子文件夹名
-    /// </summary>
-    private static string? GetPlatformSpecificPath(string baseDir)
-    {
-        string subDir = RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
-            ? "windows"
-            : RuntimeInformation.IsOSPlatform(OSPlatform.OSX)
-                ? "macos"
-                : "linux";
-
-        return Path.Combine(baseDir, "ffmpeg", subDir);
-    }
-
-    /// <summary>
-    /// 检查目录中是否有 FFmpeg 库文件
-    /// </summary>
-    private static bool HasFFmpegDlls(string directory)
-    {
-        if (!Directory.Exists(directory)) return false;
-
-        try
-        {
-            string searchPattern = RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
-                ? "avcodec-*.dll"
-                : "libavcodec.so*";
-
-            var files = Directory.GetFiles(directory, searchPattern);
-            return files.Length > 0;
-        }
-        catch
-        {
-            return false;
-        }
-    }
-
-    /// <summary>
-    /// 从应用目录向上查找项目根目录（包含 .git 或 .sln）
-    /// </summary>
-    private static string? FindProjectRoot()
-    {
-        try
-        {
-            var dir = new DirectoryInfo(AppContext.BaseDirectory);
-            for (int i = 0; i < 8 && dir != null; i++, dir = dir.Parent)
-            {
-                bool hasGit = Directory.Exists(Path.Combine(dir.FullName, ".git"));
-                bool hasSln = Directory.GetFiles(dir.FullName, "*.sln", SearchOption.TopDirectoryOnly).Length > 0;
-                if (hasGit || hasSln)
-                    return dir.FullName;
-            }
-        }
-        catch { /* 忽略权限等错误 */ }
-
-        return null;
-    }
-
-    /// <summary>
-    /// 详细的 FFmpeg 库缺失帮助信息
-    /// </summary>
-    private static string GetFFmpegHelpMessage()
-    {
-        string platform = RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? "Windows"
-                        : RuntimeInformation.IsOSPlatform(OSPlatform.OSX) ? "macOS"
-                        : "Linux";
-
-        string platformDir = RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? "windows"
-                           : RuntimeInformation.IsOSPlatform(OSPlatform.OSX) ? "macos"
-                           : "linux";
-
-        return $@"
-┌────────────────────────────────────────────────────────────────┐
-│  ❌ FFmpeg 动态库未找到                                         │
-├────────────────────────────────────────────────────────────────┤
-│                                                                │
-│  当前平台: {platform,-55} │
-│  应用目录: {AppContext.BaseDirectory,-55} │
-│                                                                │
-│  期望目录结构:                                                  │
-│    AsciiFlow/                                                  │
-│    └── ffmpeg/                                                 │
-│        └── {platformDir}/                                        │
-│            ├─ {(RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? "avcodec-61.dll" : "libavcodec.so.*",-50)} │
-│            ├─ {(RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? "avformat-61.dll" : "libavformat.so.*",-50)} │
-│            ├─ {(RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? "avutil-59.dll" : "libavutil.so.*",-50)} │
-│            └─ ...                                              │
-│                                                                │
-│  解决方式:                                                      │
-│    1. 将 FFmpeg 库文件放入 ffmpeg/{platformDir,-7}/ 文件夹                   │
-│    2. 设置环境变量 FFMPEG_ROOT=/path/to/ffmpeg                 │
-│    3. 将 FFmpeg 库所在目录加入系统 PATH                        │
-│                                                                │
-│  获取 FFmpeg:                                                  │
-│    Windows: https://www.gyan.dev/ffmpeg/builds/                │
-│    Linux:   sudo apt install libavcodec-dev libavformat-dev ... │
-│    macOS:   brew install ffmpeg                                │
-│                                                                │
-└────────────────────────────────────────────────────────────────┘
-";
-    }
-
-    /// <summary>
     /// 主执行流程
     /// </summary>
-    static async Task<int> RunAsync(CommandLineOptions options)
+    static int Run(CommandLineOptions options, CancellationToken cancellationToken)
     {
         var stopwatch = Stopwatch.StartNew();
         var pipeline = new VideoPipeline();
 
         try
         {
+            SetupFFmpegRootPath();
             Console.WriteLine("╔══════════════════════════════════════════════╗");
             Console.WriteLine("║     AsciiFlow - ASCII 视频转换器 v1.0.0      ║");
             Console.WriteLine("╚══════════════════════════════════════════════╝");
@@ -223,14 +86,15 @@ class Program
             PrintConfiguration(options);
 
             // 初始化流水线
-            pipeline.Initialize(options);
+            VideoProcessingRequest request = options.ToProcessingRequest();
+            pipeline.Initialize(request);
 
             Console.WriteLine();
             Console.WriteLine("开始处理...");
             Console.WriteLine(new string('─', 50));
 
             // 处理视频
-            int totalFrames = pipeline.Process(options);
+            int totalFrames = pipeline.Process(request, cancellationToken);
 
             // 完成编码（使用 Finish 而不是 Finalize，避免与 object.Finalize 冲突）
             pipeline.WriteTrailer();
@@ -247,13 +111,19 @@ class Program
             Console.WriteLine("╚══════════════════════════════════════════════╝");
             Console.WriteLine();
             Console.WriteLine($"输出文件: {Path.GetFullPath(options.OutputFile)}");
-            
+
             if (File.Exists(options.OutputFile))
             {
                 Console.WriteLine($"文件大小: {new FileInfo(options.OutputFile).Length / 1024.0 / 1024.0:F2} MB");
             }
 
             return 0;
+        }
+        catch (OperationCanceledException)
+        {
+            Console.WriteLine();
+            Console.WriteLine("处理已取消，未替换原输出文件。");
+            return 130;
         }
         catch (Exception ex)
         {
@@ -302,13 +172,14 @@ class Program
         Console.WriteLine("【配置信息】");
         Console.WriteLine($"  输入文件: {options.InputFile}");
         Console.WriteLine($"  输出文件: {options.OutputFile}");
-        string heightText = options.Height > 0 ? $"{options.Height}" : "自动 (16:9对应135)";
+        string heightText = options.Height > 0 ? $"{options.Height}" : "自动";
         Console.WriteLine($"  ASCII 尺寸: {options.Width} × {heightText} 字符");
         Console.WriteLine($"  输出尺寸: 遵循原视频分辨率");
         string fpsText = options.FrameRate > 0 ? $"{options.FrameRate} fps" : "自动（与原视频保持一致）";
         Console.WriteLine($"  帧率: {fpsText}");
         Console.WriteLine($"  字符集: {options.CharSet}");
         Console.WriteLine($"  字体: {options.FontFamily} {options.FontSize}px");
+        Console.WriteLine($"  彩色模式: {(options.Color ? "开启" : "关闭")}");
 
         if (options.MaxFrames > 0)
         {
@@ -317,7 +188,7 @@ class Program
 
         Console.WriteLine();
         Console.WriteLine("【处理流水线】");
-        Console.WriteLine("  [解码] FFmpeg → SIMD灰度 → ASCII映射 → SkiaSharp渲染 → H.264编码 [输出]");
+        Console.WriteLine("  [解码] FFmpeg → 并行灰度 → ASCII映射 → SkiaSharp渲染 → H.264编码 [输出]");
     }
 
     /// <summary>
@@ -366,7 +237,7 @@ class Program
         double avgFrameTime = (stats.DecodeTimeMs + stats.GrayscaleTimeMs +
                                stats.MappingTimeMs + stats.RenderTimeMs + stats.EncodeTimeMs)
                               / (double)totalFrames;
-        double theoreticalFps = 1000.0 / avgFrameTime;
+        double theoreticalFps = avgFrameTime > 0 ? 1000.0 / avgFrameTime : 0;
 
         Console.WriteLine($"【性能评估】");
         Console.WriteLine($"  单帧平均耗时: {avgFrameTime:F2}ms");
@@ -375,11 +246,11 @@ class Program
 
         if (avgFrameTime <= 30)
         {
-            Console.WriteLine("  ✅ 性能优异！可以轻松处理 1080p30");
+            Console.WriteLine("  ✅ 当前配置的处理速度高于 30 FPS 实时基准");
         }
         else if (avgFrameTime <= 50)
         {
-            Console.WriteLine("  ✅ 性能良好！可以流畅处理 720p30");
+            Console.WriteLine("  ✅ 当前配置接近 20–30 FPS");
         }
         else if (avgFrameTime <= 100)
         {

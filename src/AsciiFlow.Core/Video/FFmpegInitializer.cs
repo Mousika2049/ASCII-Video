@@ -18,14 +18,14 @@ public static class FFmpegInitializer
     public static class ErrorCode
     {
         /// <summary>AVERROR_EOF - 文件结束</summary>
-        public const int EOF = unchecked((int)0x20464F45); // FFERRTAG('E','O','F',' ')
-        
+        public static readonly int EOF = ffmpeg.AVERROR_EOF;
+
         /// <summary>AVERROR_EAGAIN - 需要更多数据</summary>
         public const int EAGAIN = -11;
-        
+
         /// <summary>AVERROR_EIO - I/O 错误</summary>
         public const int EIO = -5;
-        
+
         /// <summary>AVERROR_EINVAL - 无效参数</summary>
         public const int EINVAL = -22;
     }
@@ -54,7 +54,7 @@ public static class FFmpegInitializer
                 var version = ffmpeg.av_version_info();
                 Console.WriteLine($"[FFmpeg] 初始化成功");
                 Console.WriteLine($"[FFmpeg] 版本信息: {version}");
-                
+
                 _initialized = true;
             }
             catch (DllNotFoundException ex)
@@ -68,11 +68,11 @@ public static class FFmpegInitializer
                 // "Specified method is not supported" 通常是 ABI 版本不匹配
                 throw new NotSupportedException(
                     $"FFmpeg ABI 不兼容：{ex.Message}\n\n" +
-                    "可能原因：FFmpeg.AutoGen 8.1.0 需要 FFmpeg 7.x 系列库。\n" +
+                    "可能原因：FFmpeg.AutoGen 8.1.0 需要兼容的 FFmpeg 8.x 动态库。\n" +
                     "请确认您的 FFmpeg 库版本与 FFmpeg.AutoGen 版本匹配。\n\n" +
                     "检查系统 FFmpeg 版本: ffmpeg -version\n" +
                     FFmpegPathResolver.GetHelpMessage(), ex);
-            }        
+            }
         }
     }
 

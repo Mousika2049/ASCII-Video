@@ -1,3 +1,5 @@
+using AsciiFlow.Core.Video;
+
 namespace AsciiFlow.Core.Encoding;
 
 /// <summary>
@@ -28,7 +30,7 @@ public interface IVideoEncoder : IDisposable
     /// <param name="width">视频宽度（像素）</param>
     /// <param name="height">视频高度（像素）</param>
     /// <param name="frameRate">视频帧率（fps）</param>
-    void Initialize(string outputPath, int width, int height, double frameRate = 30.0);
+    void Initialize(string outputPath, int width, int height, VideoFrameRate frameRate);
 
     /// <summary>
     /// 编码一帧 RGB24 图像数据
