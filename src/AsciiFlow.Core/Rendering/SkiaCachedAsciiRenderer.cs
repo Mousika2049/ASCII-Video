@@ -12,6 +12,8 @@ public class SkiaCachedAsciiRenderer : IAsciiRenderer
     private readonly CharacterSetConfig _config;
     private readonly int _targetWidth;
     private readonly int _targetHeight;
+    private readonly int[] _cellXBoundaries;
+    private readonly int[] _cellYBoundaries;
 
     // 字符缓存：256 个 ASCII 字符的 RGB24 位图数据与 Alpha 遮罩数据
     private byte[][] _charBitmaps = new byte[256][];
@@ -57,6 +59,8 @@ public class SkiaCachedAsciiRenderer : IAsciiRenderer
         if (targetWidth <= 0 || targetHeight <= 0 || outputWidth <= 0 || outputHeight <= 0)
             throw new ArgumentOutOfRangeException(nameof(targetWidth), "网格和输出尺寸必须为正数");
         _rgbBuffer = new byte[checked(outputWidth * outputHeight * 3)];
+        _cellXBoundaries = BuildCellBoundaries(targetWidth, outputWidth);
+        _cellYBoundaries = BuildCellBoundaries(targetHeight, outputHeight);
     }
 
     /// <summary>
@@ -65,9 +69,6 @@ public class SkiaCachedAsciiRenderer : IAsciiRenderer
     public void Initialize()
     {
         if (_initialized) return;
-
-        Console.WriteLine($"[渲染器] 预渲染字符缓存（字体: {_config.FontFamily}, 大小: {_config.FontSize}px）...");
-        var sw = System.Diagnostics.Stopwatch.StartNew();
 
         // 使用 SkiaSharp 3.x 新 API：SKFont + SKPaint 分离
         using var font = CreateSkFont();
@@ -79,9 +80,6 @@ public class SkiaCachedAsciiRenderer : IAsciiRenderer
             _charBitmaps[i] = rgb;
             _charAlphaMasks[i] = alpha;
         }
-
-        sw.Stop();
-        Console.WriteLine($"[渲染器] 预渲染完成，耗时 {sw.Elapsed.TotalMilliseconds:F1}ms");
 
         _initialized = true;
     }
@@ -174,10 +172,7 @@ public class SkiaCachedAsciiRenderer : IAsciiRenderer
                 throw new ArgumentException("ASCII 颜色数组长度不正确", nameof(frame));
         }
 
-        Array.Clear(_rgbBuffer);
-
         int outputWidth = OutputWidth;
-        int outputHeight = OutputHeight;
         int rowStride = outputWidth * 3;
         int charWidth = CharWidth;
         int charHeight = CharHeight;
@@ -190,8 +185,8 @@ public class SkiaCachedAsciiRenderer : IAsciiRenderer
                 Parallel.For(0, frame.Height, targetY =>
                 {
                     byte* destination = (byte*)bufferAddress;
-                    int y0 = targetY * outputHeight / frame.Height;
-                    int y1 = (targetY + 1) * outputHeight / frame.Height;
+                    int y0 = _cellYBoundaries[targetY];
+                    int y1 = _cellYBoundaries[targetY + 1];
                     int cellHeight = y1 - y0;
 
                     for (int targetX = 0; targetX < frame.Width; targetX++)
@@ -200,13 +195,29 @@ public class SkiaCachedAsciiRenderer : IAsciiRenderer
                         int characterCode = frame.Characters[cellIndex] < 256
                             ? frame.Characters[cellIndex]
                             : 32;
-                        int x0 = targetX * outputWidth / frame.Width;
-                        int x1 = (targetX + 1) * outputWidth / frame.Width;
+                        int x0 = _cellXBoundaries[targetX];
+                        int x1 = _cellXBoundaries[targetX + 1];
                         int cellWidth = x1 - x0;
                         if (cellWidth <= 0 || cellHeight <= 0) continue;
 
                         byte[] bitmap = _charBitmaps[characterCode];
                         byte[] alphaMask = _charAlphaMasks[characterCode];
+
+                        if (!useColor && cellWidth == charWidth && cellHeight == charHeight)
+                        {
+                            fixed (byte* source = bitmap)
+                            {
+                                long rowBytes = charWidth * 3L;
+                                for (int row = 0; row < charHeight; row++)
+                                {
+                                    byte* sourceRow = source + row * charWidth * 3;
+                                    byte* destinationRow = destination + (y0 + row) * rowStride + x0 * 3;
+                                    Buffer.MemoryCopy(sourceRow, destinationRow, rowBytes, rowBytes);
+                                }
+                            }
+                            continue;
+                        }
+
                         (byte R, byte G, byte B) foreground = useColor
                             ? frame.Colors![cellIndex]
                             : _config.ForegroundColor;
@@ -217,13 +228,18 @@ public class SkiaCachedAsciiRenderer : IAsciiRenderer
                         byte strokeG = useColor ? (byte)Math.Min(255, (int)(foreground.G * 1.25f)) : foreground.G;
                         byte strokeB = useColor ? (byte)Math.Min(255, (int)(foreground.B * 1.25f)) : foreground.B;
 
+                        bool exactCellSize = cellWidth == charWidth && cellHeight == charHeight;
                         for (int outputY = y0; outputY < y1; outputY++)
                         {
-                            int sourceY = Math.Min(charHeight - 1, (outputY - y0) * charHeight / cellHeight);
+                            int sourceY = exactCellSize
+                                ? outputY - y0
+                                : Math.Min(charHeight - 1, (outputY - y0) * charHeight / cellHeight);
                             int outputRow = outputY * rowStride;
                             for (int outputX = x0; outputX < x1; outputX++)
                             {
-                                int sourceX = Math.Min(charWidth - 1, (outputX - x0) * charWidth / cellWidth);
+                                int sourceX = exactCellSize
+                                    ? outputX - x0
+                                    : Math.Min(charWidth - 1, (outputX - x0) * charWidth / cellWidth);
                                 int sourcePixel = sourceY * charWidth + sourceX;
                                 byte* pixel = destination + outputRow + outputX * 3;
 
@@ -237,6 +253,21 @@ public class SkiaCachedAsciiRenderer : IAsciiRenderer
                                 }
 
                                 byte alpha = alphaMask[sourcePixel];
+                                if (alpha == 0)
+                                {
+                                    pixel[0] = background.R;
+                                    pixel[1] = background.G;
+                                    pixel[2] = background.B;
+                                    continue;
+                                }
+                                if (alpha == 255)
+                                {
+                                    pixel[0] = strokeR;
+                                    pixel[1] = strokeG;
+                                    pixel[2] = strokeB;
+                                    continue;
+                                }
+
                                 int inverseAlpha = 255 - alpha;
                                 pixel[0] = (byte)((strokeR * alpha + background.R * inverseAlpha) / 255);
                                 pixel[1] = (byte)((strokeG * alpha + background.G * inverseAlpha) / 255);
@@ -249,6 +280,14 @@ public class SkiaCachedAsciiRenderer : IAsciiRenderer
         }
 
         return _rgbBuffer;
+    }
+
+    private static int[] BuildCellBoundaries(int cellCount, int outputSize)
+    {
+        var boundaries = new int[cellCount + 1];
+        for (int index = 0; index <= cellCount; index++)
+            boundaries[index] = (int)((long)index * outputSize / cellCount);
+        return boundaries;
     }
 
     /// <summary>

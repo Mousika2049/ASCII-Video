@@ -1,5 +1,5 @@
 using System;
-using System.IO;
+using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using AsciiFlow.Core.Video;
 using FFmpeg.AutoGen;
@@ -10,7 +10,7 @@ namespace AsciiFlow.Core.Encoding;
 /// 基于 FFmpeg.AutoGen 8.1.0 的 H.264 视频编码器
 /// 性能目标：~20ms/帧（1080p，CRF 23）
 /// </summary>
-public unsafe class FFmpegVideoEncoder : IVideoEncoder
+public unsafe class FFmpegVideoEncoder : IVideoEncoder, IVideoEncoderMetrics
 {
     // FFmpeg 上下文
     private AVFormatContext* _formatContext;
@@ -31,6 +31,12 @@ public unsafe class FFmpegVideoEncoder : IVideoEncoder
     private bool _initialized;
     private bool _disposed;
     private string _outputPath;
+    private VideoEncoderSettings _settings = VideoEncoderSettings.Speed;
+
+    private double _colorConversionTimeMs;
+    private double _codecTimeMs;
+    private double _muxTimeMs;
+    private double _finishTimeMs;
 
     // FFmpeg 错误码常量
     private const int AVERROR_EAGAIN = -11;
@@ -38,8 +44,6 @@ public unsafe class FFmpegVideoEncoder : IVideoEncoder
 
     // 编码器配置
     private const string CodecName = "libx264";
-    private const int DefaultCRF = 23;
-    private const string DefaultPreset = "fast";  // fast 预设兼顾速度和质量
 
     /// <summary>编码器是否已初始化</summary>
     public bool IsInitialized => _initialized;
@@ -55,11 +59,27 @@ public unsafe class FFmpegVideoEncoder : IVideoEncoder
 
     /// <summary>已编码帧数</summary>
     public long EncodedFrames => _encodedFrames;
+    public double ColorConversionTimeMs => _colorConversionTimeMs;
+    public double CodecTimeMs => _codecTimeMs;
+    public double MuxTimeMs => _muxTimeMs;
+    public double FinishTimeMs => _finishTimeMs;
+    public VideoEncoderSettings Settings => _settings;
 
     public FFmpegVideoEncoder()
     {
         // Ensure non-nullable fields are initialized to satisfy the compiler
         _outputPath = string.Empty;
+    }
+
+    public void Configure(VideoEncoderSettings settings)
+    {
+        if (_initialized)
+            throw new InvalidOperationException("编码器初始化后不能修改配置");
+        _settings = settings ?? throw new ArgumentNullException(nameof(settings));
+        if (_settings.Crf is < 0 or > 51)
+            throw new ArgumentOutOfRangeException(nameof(settings), "CRF 必须在 0 到 51 之间");
+        if (string.IsNullOrWhiteSpace(_settings.Preset))
+            throw new ArgumentException("编码预设不能为空", nameof(settings));
     }
 
     private int _audioStreamIndex = -1;
@@ -103,6 +123,10 @@ public unsafe class FFmpegVideoEncoder : IVideoEncoder
         _height = height;
         _exactFrameRate = frameRate.Reduce();
         _frameRate = _exactFrameRate.Value;
+        _colorConversionTimeMs = 0;
+        _codecTimeMs = 0;
+        _muxTimeMs = 0;
+        _finishTimeMs = 0;
 
         try
         {
@@ -124,7 +148,6 @@ public unsafe class FFmpegVideoEncoder : IVideoEncoder
                     outAudioStream->codecpar->codec_tag = 0;
                     outAudioStream->time_base = inAudioStream->time_base;
                     _audioStreamIndex = outAudioStream->index;
-                    Console.WriteLine($"[编码器] ✓ 挂载原音频轨 (Stream #{_audioStreamIndex})");
                 }
             }
 
@@ -142,9 +165,6 @@ public unsafe class FFmpegVideoEncoder : IVideoEncoder
             _initialized = true;
             _encodedFrames = 0;
 
-            Console.WriteLine($"[编码器] 初始化完成: {outputPath}");
-            Console.WriteLine($"[编码器] 分辨率: {width}x{height}, 帧率: {_frameRate:F3} fps ({_exactFrameRate})");
-            Console.WriteLine($"[编码器] 编码: {CodecName}, CRF: {DefaultCRF}, 预设: {DefaultPreset}");
         }
         catch (Exception ex)
         {
@@ -245,6 +265,8 @@ public unsafe class FFmpegVideoEncoder : IVideoEncoder
             den = _exactFrameRate.Denominator
         };
         _codecContext->time_base = ffmpeg.av_inv_q(_codecContext->framerate);
+        stream->time_base = _codecContext->time_base;
+        stream->avg_frame_rate = _codecContext->framerate;
 
         // GOP 结构：每 2 秒一个关键帧
         _codecContext->gop_size = (int)(_frameRate * 2);
@@ -256,9 +278,10 @@ public unsafe class FFmpegVideoEncoder : IVideoEncoder
 
         // 设置 H.264 特定选项（CRF + 预设）
         AVDictionary* options = null;
-        SetDictionaryOption(ref options, "preset", DefaultPreset);
-        SetDictionaryOption(ref options, "crf", DefaultCRF.ToString());
-        SetDictionaryOption(ref options, "tune", "fastdecode");  // 针对快速解码优化
+        SetDictionaryOption(ref options, "preset", _settings.Preset);
+        SetDictionaryOption(ref options, "crf", _settings.Crf.ToString());
+        if (!string.IsNullOrEmpty(_settings.Tune))
+            SetDictionaryOption(ref options, "tune", _settings.Tune);
 
         // 打开编码器
         int ret = ffmpeg.avcodec_open2(_codecContext, codec, &options);
@@ -318,6 +341,7 @@ public unsafe class FFmpegVideoEncoder : IVideoEncoder
         _yuvFrame->format = (int)AVPixelFormat.AV_PIX_FMT_YUV420P;
         _yuvFrame->width = _width;
         _yuvFrame->height = _height;
+        _yuvFrame->time_base = _codecContext->time_base;
 
         // 分配帧缓冲区
         int bufferSize = ffmpeg.av_image_get_buffer_size(
@@ -367,19 +391,25 @@ public unsafe class FFmpegVideoEncoder : IVideoEncoder
                 $"RGB 数据长度错误: 期望 {_width * _height * 3}, 实际 {rgbData.Length}");
 
         // 1. RGB24 → YUV420P 格式转换
+        long startTimestamp = Stopwatch.GetTimestamp();
         ConvertRGBToYUV(rgbData);
+        _colorConversionTimeMs += Stopwatch.GetElapsedTime(startTimestamp).TotalMilliseconds;
 
         // 2. 设置帧时间戳
         _yuvFrame->pts = _encodedFrames;
         _encodedFrames++;
 
         // 3. 发送到编码器
+        startTimestamp = Stopwatch.GetTimestamp();
         int sendRet = ffmpeg.avcodec_send_frame(_codecContext, _yuvFrame);
+        _codecTimeMs += Stopwatch.GetElapsedTime(startTimestamp).TotalMilliseconds;
         if (sendRet == AVERROR_EAGAIN)
         {
             // 先读取编码后的包
             ReceiveAndWritePackets();
+            startTimestamp = Stopwatch.GetTimestamp();
             sendRet = ffmpeg.avcodec_send_frame(_codecContext, _yuvFrame);
+            _codecTimeMs += Stopwatch.GetElapsedTime(startTimestamp).TotalMilliseconds;
         }
         if (sendRet < 0)
             throw new FFmpegEncoderException("发送帧到编码器失败", sendRet);
@@ -422,7 +452,9 @@ public unsafe class FFmpegVideoEncoder : IVideoEncoder
     {
         while (true)
         {
+            long startTimestamp = Stopwatch.GetTimestamp();
             int ret = ffmpeg.avcodec_receive_packet(_codecContext, _packet);
+            _codecTimeMs += Stopwatch.GetElapsedTime(startTimestamp).TotalMilliseconds;
 
             if (ret == AVERROR_EAGAIN)
                 break;  // 需要更多帧
@@ -454,7 +486,9 @@ public unsafe class FFmpegVideoEncoder : IVideoEncoder
         ffmpeg.av_packet_rescale_ts(_packet, _codecContext->time_base, stream->time_base);
 
         // 写入容器
+        long startTimestamp = Stopwatch.GetTimestamp();
         int ret = ffmpeg.av_interleaved_write_frame(_formatContext, _packet);
+        _muxTimeMs += Stopwatch.GetElapsedTime(startTimestamp).TotalMilliseconds;
         if (ret < 0)
             throw new FFmpegEncoderException("写入视频包失败", ret);
     }
@@ -466,7 +500,9 @@ public unsafe class FFmpegVideoEncoder : IVideoEncoder
     {
         if (!_initialized) return;
 
-        Console.WriteLine("[编码器] 正在完成编码...");
+        long finishTimestamp = Stopwatch.GetTimestamp();
+        double codecTimeBeforeFinish = _codecTimeMs;
+        double muxTimeBeforeFinish = _muxTimeMs;
 
         try
         {
@@ -483,16 +519,13 @@ public unsafe class FFmpegVideoEncoder : IVideoEncoder
             if (ret < 0)
                 throw new FFmpegEncoderException("写入视频文件尾失败", ret);
 
-            Console.WriteLine($"[编码器] 编码完成: 共 {_encodedFrames} 帧");
-            if (_encodedFrames > 0)
-            {
-                var file = new FileInfo(_outputPath);
-                double fileSizeMB = file.Length / (1024.0 * 1024.0);
-                Console.WriteLine($"[编码器] 输出文件: {_outputPath} ({fileSizeMB:F2} MB)");
-            }
         }
         finally
         {
+            _finishTimeMs = Stopwatch.GetElapsedTime(finishTimestamp).TotalMilliseconds;
+            // FinishTimeMs 单独覆盖刷新阶段，逐帧指标不重复包含 flush 与 trailer。
+            _codecTimeMs = codecTimeBeforeFinish;
+            _muxTimeMs = muxTimeBeforeFinish;
             _initialized = false;
             Cleanup();
         }

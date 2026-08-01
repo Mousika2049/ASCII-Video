@@ -9,19 +9,17 @@ namespace AsciiFlow.App.Core;
 
 /// <summary>
 /// 视频处理流水线管理器
-/// 整合：解码 → 灰度 → 映射 → 渲染 → 编码
+/// 整合：解码 → 灰度/颜色融合映射 → 渲染 → 编码
 /// </summary>
 public class VideoPipeline : IDisposable
 {
     private readonly Func<IVideoDecoder> _decoderFactory;
-    private readonly Func<IGrayscaleConverter> _grayscaleConverterFactory;
     private readonly Func<string, IAsciiMapper> _asciiMapperFactory;
     private readonly Func<CharacterSetConfig, int, int, int, int, IAsciiRenderer> _rendererFactory;
     private readonly Func<IVideoEncoder> _encoderFactory;
 
     // 各模块实例
     private IVideoDecoder _decoder = null!;
-    private IGrayscaleConverter _grayscaleConverter = null!;
     private IAsciiMapper _asciiMapper = null!;
     private IAsciiRenderer _renderer = null!;
     private IVideoEncoder _encoder = null!;
@@ -35,7 +33,6 @@ public class VideoPipeline : IDisposable
 
     // 性能统计（毫秒）
     private double _decodeTimeMs;
-    private double _grayscaleTimeMs;
     private double _mappingTimeMs;
     private double _renderTimeMs;
     private double _encodeTimeMs;
@@ -49,7 +46,6 @@ public class VideoPipeline : IDisposable
     public VideoPipeline()
         : this(
             () => new FFmpegVideoDecoder(),
-            () => new ParallelGrayscaleConverter(),
             characterSet => new LookupTableAsciiMapper(characterSet),
             (config, gridWidth, gridHeight, outputWidth, outputHeight) =>
                 new SkiaCachedAsciiRenderer(config, gridWidth, gridHeight, outputWidth, outputHeight),
@@ -59,16 +55,26 @@ public class VideoPipeline : IDisposable
 
     public VideoPipeline(
         Func<IVideoDecoder> decoderFactory,
-        Func<IGrayscaleConverter> grayscaleConverterFactory,
         Func<string, IAsciiMapper> asciiMapperFactory,
         Func<CharacterSetConfig, int, int, int, int, IAsciiRenderer> rendererFactory,
         Func<IVideoEncoder> encoderFactory)
     {
         _decoderFactory = decoderFactory ?? throw new ArgumentNullException(nameof(decoderFactory));
-        _grayscaleConverterFactory = grayscaleConverterFactory ?? throw new ArgumentNullException(nameof(grayscaleConverterFactory));
         _asciiMapperFactory = asciiMapperFactory ?? throw new ArgumentNullException(nameof(asciiMapperFactory));
         _rendererFactory = rendererFactory ?? throw new ArgumentNullException(nameof(rendererFactory));
         _encoderFactory = encoderFactory ?? throw new ArgumentNullException(nameof(encoderFactory));
+    }
+
+    [Obsolete("灰度转换已融合到 ASCII 映射中，请使用不含 grayscaleConverterFactory 的构造函数。")]
+    public VideoPipeline(
+        Func<IVideoDecoder> decoderFactory,
+        Func<IGrayscaleConverter> grayscaleConverterFactory,
+        Func<string, IAsciiMapper> asciiMapperFactory,
+        Func<CharacterSetConfig, int, int, int, int, IAsciiRenderer> rendererFactory,
+        Func<IVideoEncoder> encoderFactory)
+        : this(decoderFactory, asciiMapperFactory, rendererFactory, encoderFactory)
+    {
+        ArgumentNullException.ThrowIfNull(grayscaleConverterFactory);
     }
 
     // ─────────────────────────────────────────
@@ -102,18 +108,17 @@ public class VideoPipeline : IDisposable
         if (_decoder is FFmpegVideoDecoder)
         {
             FFmpeg.AutoGen.ffmpeg.av_log_set_level(
-                request.Verbose ? FFmpeg.AutoGen.ffmpeg.AV_LOG_INFO : FFmpeg.AutoGen.ffmpeg.AV_LOG_ERROR);
+                request.Verbose ? FFmpeg.AutoGen.ffmpeg.AV_LOG_WARNING : FFmpeg.AutoGen.ffmpeg.AV_LOG_ERROR);
         }
 
         var videoInfo = _decoder.GetVideoInfo();
         int srcWidth = videoInfo.Width;
         int srcHeight = videoInfo.Height;
-        Console.WriteLine($"✓ 视频解码器: {videoInfo.Resolution}, {videoInfo.FrameRate:F2}fps, {videoInfo.FrameCount} 帧");
 
         // 计算 ASCII 字符网格尺寸 (默认 240 宽度，高度自动匹配原视频比例，16:9 为 135)
         _asciiWidth = Math.Min(request.Width, srcWidth);
         if (_asciiWidth != request.Width)
-            Console.WriteLine($"⚠ ASCII 宽度已从 {request.Width} 调整为源视频可支持的 {_asciiWidth}");
+            Console.WriteLine($"提示    ASCII 宽度已从 {request.Width} 调整为 {_asciiWidth}");
         if (request.Height > 0)
         {
             _asciiHeight = Math.Min(request.Height, srcHeight);
@@ -125,11 +130,7 @@ public class VideoPipeline : IDisposable
         if ((long)_asciiWidth * _asciiHeight > 4_000_000)
             throw new ArgumentException("ASCII 网格不能超过 400 万个单元格，请降低宽度或高度");
 
-        // 2. 初始化并行灰度转换器
-        _grayscaleConverter = _grayscaleConverterFactory();
-        Console.WriteLine($"✓ 并行灰度转换器已就绪");
-
-        // 3. 初始化 ASCII 字符映射器
+        // 2. 初始化灰度/颜色融合 ASCII 字符映射器
         string charSet = request.CharSet.ToLowerInvariant() switch
         {
             "standard" => LookupTableAsciiMapper.Standard,
@@ -137,9 +138,8 @@ public class VideoPipeline : IDisposable
             _ => LookupTableAsciiMapper.Standard
         };
         _asciiMapper = _asciiMapperFactory(charSet);
-        Console.WriteLine($"✓ ASCII 映射器已就绪（字符集: {request.CharSet}, {charSet.Length} 字符）");
 
-        // 4. 初始化 SkiaSharp 渲染器（生成视频像素分辨率完全对齐原视频分辨率）
+        // 3. 初始化 SkiaSharp 渲染器（生成视频像素分辨率完全对齐原视频分辨率）
         int charW = (int)Math.Max(1, Math.Ceiling((double)srcWidth / _asciiWidth));
         int charH = (int)Math.Max(1, Math.Ceiling((double)srcHeight / _asciiHeight));
         float fontSize = request.FontSize > 0 ? request.FontSize : (float)Math.Max(1, charH * 0.95);
@@ -161,21 +161,25 @@ public class VideoPipeline : IDisposable
         // 编码器使用的视频尺寸（遵循原视频尺寸）
         _videoWidth = _renderer.OutputWidth;    // 遵循 srcWidth
         _videoHeight = _renderer.OutputHeight;  // 遵循 srcHeight
-        Console.WriteLine($"✓ SkiaSharp 渲染器已就绪（输出尺寸对齐原视频: {_videoWidth}x{_videoHeight} 像素, 网格: {_asciiWidth}x{_asciiHeight} 字符）");
 
         VideoFrameRate outputFrameRate = request.FrameRate > 0
             ? VideoFrameRate.FromDouble(request.FrameRate)
             : videoInfo.ExactFrameRate;
         if (!outputFrameRate.IsValid) outputFrameRate = new VideoFrameRate(30, 1);
 
-        // 5. 初始化 H.264 编码器并挂载原视频音频轨
+        // 4. 初始化 H.264 编码器并挂载原视频音频轨
         _encoder = _encoderFactory();
+        VideoEncoderSettings encoderSettings = VideoEncoderSettings.FromMode(request.EncoderMode);
+        if (_encoder is FFmpegVideoEncoder configurableEncoder)
+            configurableEncoder.Configure(encoderSettings);
 
+        bool hasAudio = false;
         if (_decoder is FFmpegVideoDecoder ffmpegDecoder && _encoder is FFmpegVideoEncoder ffmpegEncoder)
         {
             unsafe
             {
                 var audioStream = ffmpegDecoder.GetAudioStream();
+                hasAudio = audioStream != null;
                 ffmpegEncoder.Initialize(_stagingOutputPath, _videoWidth, _videoHeight, outputFrameRate, audioStream);
 
                 ffmpegDecoder.OnAudioPacket = (packet, stream) =>
@@ -189,7 +193,24 @@ public class VideoPipeline : IDisposable
             _encoder.Initialize(_stagingOutputPath, _videoWidth, _videoHeight, outputFrameRate);
         }
 
-        Console.WriteLine($"✓ H.264 编码器已就绪（{_videoWidth}x{_videoHeight} @ {outputFrameRate.Value:F3}fps, {outputFrameRate}）");
+        string frameCountText = videoInfo.FrameCount > 0 ? $"{videoInfo.FrameCount} 帧" : "帧数未知";
+        Console.WriteLine($"源视频  {videoInfo.Resolution} · {videoInfo.FrameRate:F3} FPS · {frameCountText}");
+        Console.WriteLine(
+            $"输出    {_videoWidth}x{_videoHeight} · ASCII {_asciiWidth}x{_asciiHeight} · " +
+            $"{(request.Color ? "彩色" : "黑白")} · {request.EncoderMode}");
+
+        if (request.Verbose)
+        {
+            string tuneText = string.IsNullOrEmpty(encoderSettings.Tune)
+                ? string.Empty
+                : $" · tune {encoderSettings.Tune}";
+            Console.WriteLine(
+                $"编码    libx264 {encoderSettings.Preset} · CRF {encoderSettings.Crf}{tuneText} · " +
+                $"{outputFrameRate} · 音频{(hasAudio ? "透传" : "无")}");
+            Console.WriteLine(
+                $"渲染    {request.CharSet} ({charSet.Length} 字符) · " +
+                $"{request.FontFamily} {fontSize:F1}px · 单元格 {charW}x{charH}");
+        }
     }
 
     // ─────────────────────────────────────────
@@ -207,22 +228,13 @@ public class VideoPipeline : IDisposable
             ? maxFrames.Value
             : (_decoder.FrameCount > 0 ? _decoder.FrameCount : null);
 
-        // ====== [修复] 缓存解码器实际尺寸 ======
         int srcWidth = _decoder.Width;   // 原始视频宽度（如 1280）
         int srcHeight = _decoder.Height; // 原始视频高度（如 720）
-        Console.WriteLine($"[流水线] 解码器源尺寸: {srcWidth}x{srcHeight}");
-        Console.WriteLine($"[流水线] 渲染器输出: {_renderer.OutputWidth}x{_renderer.OutputHeight}");
-        Console.WriteLine($"[流水线] ASCII 目标: {_asciiWidth}x{_asciiHeight} 字符");
-        Console.WriteLine();
-        // ========================================
 
-        var progressSw = Stopwatch.StartNew();
+        bool showProgress = !request.NoProgress && !Console.IsOutputRedirected;
+        var progressSw = showProgress ? Stopwatch.StartNew() : null;
         int lastProgress = 0;
-
-        Console.WriteLine();
-        Console.WriteLine("【处理开始】");
-
-        var overallSw = Stopwatch.StartNew();
+        int lastProgressLineLength = 0;
 
         while (true)
         {
@@ -239,30 +251,24 @@ public class VideoPipeline : IDisposable
             if (rgbFrame == null)
                 break; // 视频结束
 
-            // ② RGB24 → Grayscale（并行）
-            //    【修复】使用解码器的实际宽高 srcWidth/srcHeight
-            sw.Restart();
-            byte[] grayFrame = _grayscaleConverter.ConvertToGrayscale(rgbFrame, srcWidth, srcHeight);
-            _grayscaleTimeMs += sw.Elapsed.TotalMilliseconds;
-
-            // ③ Grayscale + RGB → ASCII string & Cell Colors
+            // ② RGB24 → 灰度/颜色融合映射；不再生成和遍历整帧灰度缓冲区
             sw.Restart();
             byte[] renderedFrame;
-            AsciiFrame asciiFrame = _asciiMapper.Map(
-                grayFrame,
+            AsciiFrame asciiFrame = _asciiMapper.MapRgb(
+                rgbFrame,
                 srcWidth,
                 srcHeight,
                 _asciiWidth,
                 _asciiHeight,
-                request.Color ? rgbFrame : null);
+                request.Color);
             _mappingTimeMs += sw.Elapsed.TotalMilliseconds;
 
-            // ④ ASCII cells + Colors → RGB24 image
+            // ③ ASCII cells + Colors → RGB24 image
             sw.Restart();
             renderedFrame = _renderer.RenderFrame(asciiFrame, request.Color);
             _renderTimeMs += sw.Elapsed.TotalMilliseconds;
 
-            // ⑤ RGB24 → H.264 packet (~20ms, libx264)
+            // ④ RGB24 → H.264 packet (~20ms, libx264)
             sw.Restart();
             _encoder.EncodeFrame(renderedFrame);
             _encodeTimeMs += sw.Elapsed.TotalMilliseconds;
@@ -270,7 +276,7 @@ public class VideoPipeline : IDisposable
             totalFrames++;
 
             // 进度显示（每秒一次）
-            if (!request.NoProgress && progressSw.ElapsedMilliseconds >= 1000)
+            if (showProgress && progressSw!.ElapsedMilliseconds >= 1000)
             {
                 double elapsedSeconds = Math.Max(0.001, progressSw.Elapsed.TotalSeconds);
                 progressSw.Restart();
@@ -286,18 +292,17 @@ public class VideoPipeline : IDisposable
                 int filled = (int)(progress / 100 * barWidth);
                 string bar = new string('█', filled) + new string('░', barWidth - filled);
 
-                Console.Write(
-                    $"\r  ➤ [{bar}] {progress:F1}% | " +
-                    $"帧: {totalFrames}/{(estimatedTotalFrames > 0 ? estimatedTotalFrames.ToString() : "?")} | " +
-                    $"FPS: {fps:F0}");
+                string progressLine =
+                    $"处理    [{bar}] {progress,5:F1}% · " +
+                    $"{totalFrames}/{(estimatedTotalFrames > 0 ? estimatedTotalFrames.ToString() : "?")} 帧 · " +
+                    $"{fps:F0} FPS";
+                Console.Write($"\r{progressLine.PadRight(lastProgressLineLength)}");
+                lastProgressLineLength = Math.Max(lastProgressLineLength, progressLine.Length);
             }
         }
 
-        if (!request.NoProgress)
-            Console.WriteLine();
-
-        Console.WriteLine();
-        Console.WriteLine($"【处理完成】共处理 {totalFrames} 帧 (耗时 {overallSw.Elapsed.TotalSeconds:F2}s)");
+        if (showProgress && lastProgressLineLength > 0)
+            Console.Write($"\r{new string(' ', lastProgressLineLength)}\r");
 
         if (totalFrames == 0)
             throw new InvalidOperationException("未从输入文件解码到任何视频帧");
@@ -328,13 +333,17 @@ public class VideoPipeline : IDisposable
 
     public PerformanceStats GetStatistics()
     {
+        IVideoEncoderMetrics? encoderMetrics = _encoder as IVideoEncoderMetrics;
         return new PerformanceStats
         {
             DecodeTimeMs = _decodeTimeMs,
-            GrayscaleTimeMs = _grayscaleTimeMs,
             MappingTimeMs = _mappingTimeMs,
             RenderTimeMs = _renderTimeMs,
-            EncodeTimeMs = _encodeTimeMs
+            EncodeTimeMs = _encodeTimeMs,
+            ColorConversionTimeMs = encoderMetrics?.ColorConversionTimeMs ?? 0,
+            CodecTimeMs = encoderMetrics?.CodecTimeMs ?? 0,
+            MuxTimeMs = encoderMetrics?.MuxTimeMs ?? 0,
+            EncoderFinishTimeMs = encoderMetrics?.FinishTimeMs ?? 0
         };
     }
 
@@ -342,7 +351,6 @@ public class VideoPipeline : IDisposable
     {
         if (_disposed) return;
 
-        // 注意：IGrayscaleConverter 没有 IDisposable，跳过
         try { (_decoder as IDisposable)?.Dispose(); } catch { }
         try { (_renderer as IDisposable)?.Dispose(); } catch { }
         try { (_encoder as IDisposable)?.Dispose(); } catch { }
@@ -376,6 +384,7 @@ public class VideoPipeline : IDisposable
         if (!string.Equals(request.CharSet, "standard", StringComparison.OrdinalIgnoreCase) &&
             !string.Equals(request.CharSet, "detailed", StringComparison.OrdinalIgnoreCase))
             throw new ArgumentException("字符集只能是 standard 或 detailed", nameof(request.CharSet));
+        _ = VideoEncoderSettings.FromMode(request.EncoderMode);
     }
 }
 
@@ -385,10 +394,15 @@ public class VideoPipeline : IDisposable
 public record PerformanceStats
 {
     public double DecodeTimeMs { get; init; }
+    /// <summary>兼容旧版统计；融合映射流水线中该值为 0。</summary>
     public double GrayscaleTimeMs { get; init; }
     public double MappingTimeMs { get; init; }
     public double RenderTimeMs { get; init; }
     public double EncodeTimeMs { get; init; }
+    public double ColorConversionTimeMs { get; init; }
+    public double CodecTimeMs { get; init; }
+    public double MuxTimeMs { get; init; }
+    public double EncoderFinishTimeMs { get; init; }
 
     /// <summary>总耗时（毫秒）</summary>
     public double TotalTimeMs =>

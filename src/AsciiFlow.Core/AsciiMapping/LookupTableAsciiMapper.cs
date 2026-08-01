@@ -5,11 +5,16 @@ namespace AsciiFlow.Core.AsciiMapping;
 /// </summary>
 public class LookupTableAsciiMapper : IAsciiMapper
 {
+    private const int RedLuminanceCoefficient = 54;
+    private const int GreenLuminanceCoefficient = 183;
+    private const int BlueLuminanceCoefficient = 19;
     private readonly char[] _characterSet;
     private readonly char[] _lookupTable;
     private readonly ParallelOptions _parallelOptions;
     private char[] _characterBuffer = [];
     private (byte R, byte G, byte B)[] _colorBuffer = [];
+    private AsciiFrame? _monochromeFrame;
+    private AsciiFrame? _colorFrame;
 
     /// <summary>
     /// 字符集预设（由暗到亮排序：适合黑底白字/彩色 ASCII 渲染）
@@ -175,11 +180,136 @@ public class LookupTableAsciiMapper : IAsciiMapper
             }
         }
 
-        return new AsciiFrame(
-            targetWidth,
-            targetHeight,
-            _characterBuffer,
-            includeColor ? _colorBuffer : null);
+        return GetReusableFrame(targetWidth, targetHeight, includeColor);
+    }
+
+    /// <summary>
+    /// 直接从 RGB24 计算 BT.709 灰度并聚合字符单元格，避免先生成整帧灰度缓冲区。
+    /// 计算顺序与“灰度转换后再映射”完全一致。
+    /// </summary>
+    public AsciiFrame MapRgb(
+        byte[] rgbData,
+        int width,
+        int height,
+        int targetWidth,
+        int targetHeight,
+        bool includeColor)
+    {
+        ValidateRgbParameters(rgbData, width, height, targetWidth, targetHeight);
+
+        int cellCount = checked(targetWidth * targetHeight);
+        if (_characterBuffer.Length != cellCount)
+            _characterBuffer = new char[cellCount];
+        if (includeColor && _colorBuffer.Length != cellCount)
+            _colorBuffer = new (byte R, byte G, byte B)[cellCount];
+
+        unsafe
+        {
+            fixed (byte* rgbPtr = rgbData)
+            {
+                IntPtr rgbAddress = (IntPtr)rgbPtr;
+                if (includeColor)
+                {
+                    Parallel.For(0, targetHeight, _parallelOptions, targetY =>
+                    {
+                        byte* source = (byte*)rgbAddress;
+                        int startY = targetY * height / targetHeight;
+                        int endY = (targetY + 1) * height / targetHeight;
+
+                        for (int targetX = 0; targetX < targetWidth; targetX++)
+                        {
+                            int startX = targetX * width / targetWidth;
+                            int endX = (targetX + 1) * width / targetWidth;
+                            long sumR = 0, sumG = 0, sumB = 0, sumGray = 0;
+                            int count = 0;
+
+                            for (int y = startY; y < endY; y++)
+                            {
+                                int rgbIndex = (y * width + startX) * 3;
+                                for (int x = startX; x < endX; x++, rgbIndex += 3)
+                                {
+                                    byte red = source[rgbIndex];
+                                    byte green = source[rgbIndex + 1];
+                                    byte blue = source[rgbIndex + 2];
+                                    sumR += red;
+                                    sumG += green;
+                                    sumB += blue;
+                                    sumGray += (red * RedLuminanceCoefficient +
+                                                green * GreenLuminanceCoefficient +
+                                                blue * BlueLuminanceCoefficient) >> 8;
+                                    count++;
+                                }
+                            }
+
+                            int targetIndex = targetY * targetWidth + targetX;
+                            byte averageGray = count > 0 ? (byte)(sumGray / count) : (byte)0;
+                            _characterBuffer[targetIndex] = _lookupTable[averageGray];
+                            _colorBuffer[targetIndex] = count > 0
+                                ? ((byte)(sumR / count), (byte)(sumG / count), (byte)(sumB / count))
+                                : ((byte)255, (byte)255, (byte)255);
+                        }
+                    });
+                }
+                else
+                {
+                    Parallel.For(0, targetHeight, _parallelOptions, targetY =>
+                    {
+                        byte* source = (byte*)rgbAddress;
+                        int startY = targetY * height / targetHeight;
+                        int endY = (targetY + 1) * height / targetHeight;
+
+                        for (int targetX = 0; targetX < targetWidth; targetX++)
+                        {
+                            int startX = targetX * width / targetWidth;
+                            int endX = (targetX + 1) * width / targetWidth;
+                            long sumGray = 0;
+                            int count = 0;
+
+                            for (int y = startY; y < endY; y++)
+                            {
+                                int rgbIndex = (y * width + startX) * 3;
+                                for (int x = startX; x < endX; x++, rgbIndex += 3)
+                                {
+                                    byte red = source[rgbIndex];
+                                    byte green = source[rgbIndex + 1];
+                                    byte blue = source[rgbIndex + 2];
+                                    sumGray += (red * RedLuminanceCoefficient +
+                                                green * GreenLuminanceCoefficient +
+                                                blue * BlueLuminanceCoefficient) >> 8;
+                                    count++;
+                                }
+                            }
+
+                            int targetIndex = targetY * targetWidth + targetX;
+                            byte averageGray = count > 0 ? (byte)(sumGray / count) : (byte)0;
+                            _characterBuffer[targetIndex] = _lookupTable[averageGray];
+                        }
+                    });
+                }
+            }
+        }
+
+        return GetReusableFrame(targetWidth, targetHeight, includeColor);
+    }
+
+    private AsciiFrame GetReusableFrame(int width, int height, bool includeColor)
+    {
+        AsciiFrame? cached = includeColor ? _colorFrame : _monochromeFrame;
+        (byte R, byte G, byte B)[]? colors = includeColor ? _colorBuffer : null;
+        if (cached is null ||
+            cached.Width != width ||
+            cached.Height != height ||
+            !ReferenceEquals(cached.Characters, _characterBuffer) ||
+            !ReferenceEquals(cached.Colors, colors))
+        {
+            cached = new AsciiFrame(width, height, _characterBuffer, colors);
+            if (includeColor)
+                _colorFrame = cached;
+            else
+                _monochromeFrame = cached;
+        }
+
+        return cached;
     }
 
     /// <summary>
@@ -212,6 +342,29 @@ public class LookupTableAsciiMapper : IAsciiMapper
         if (rgbData is not null && rgbData.Length != checked(pixelCount * 3))
             throw new ArgumentException(
                 $"RGB data length {rgbData.Length} doesn't match {width}x{height}", nameof(rgbData));
+    }
+
+    private static void ValidateRgbParameters(
+        byte[] rgbData,
+        int width,
+        int height,
+        int targetWidth,
+        int targetHeight)
+    {
+        ArgumentNullException.ThrowIfNull(rgbData);
+
+        if (width <= 0 || height <= 0)
+            throw new ArgumentOutOfRangeException(
+                $"Width and height must be positive: {width}x{height}");
+
+        int pixelCount = checked(width * height);
+        if (rgbData.Length != checked(pixelCount * 3))
+            throw new ArgumentException(
+                $"RGB data length {rgbData.Length} doesn't match {width}x{height}", nameof(rgbData));
+
+        if (targetWidth <= 0 || targetHeight <= 0 || targetWidth > width || targetHeight > height)
+            throw new ArgumentOutOfRangeException(
+                $"Target dimensions must be positive and not exceed the source: {targetWidth}x{targetHeight}");
     }
 
     private static string ToAsciiString(AsciiFrame frame)

@@ -51,9 +51,7 @@ public static class FFmpegInitializer
             {
                 // FFmpeg.AutoGen 8.1.0 使用静态类初始化
                 // 通过访问任意方法触发初始化
-                var version = ffmpeg.av_version_info();
-                Console.WriteLine($"[FFmpeg] 初始化成功");
-                Console.WriteLine($"[FFmpeg] 版本信息: {version}");
+                _ = ffmpeg.av_version_info();
 
                 _initialized = true;
             }

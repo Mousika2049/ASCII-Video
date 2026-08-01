@@ -36,6 +36,10 @@ public class CommandLineOptions
     [Option("max-frames", Required = false, Default = 0, HelpText = "最大处理帧数（0 = 全部）")]
     public int MaxFrames { get; set; } = 0;
 
+    [Option("encoder-mode", Required = false, Default = "speed",
+        HelpText = "编码模式: speed(默认最大吞吐)、balanced(较小文件) 或 quality(旧版质量参数)")]
+    public string EncoderMode { get; set; } = "speed";
+
     [Option('C', "color", Required = false, Default = "true", HelpText = "是否启用彩色 ASCII 模式：true 或 false（默认 true）")]
     public string ColorValue { get; set; } = "true";
 
@@ -60,6 +64,7 @@ public class CommandLineOptions
         FontSize = FontSize,
         FontFamily = FontFamily,
         MaxFrames = MaxFrames,
+        EncoderMode = EncoderMode,
         Color = Color,
         Verbose = Verbose,
         NoProgress = NoProgress

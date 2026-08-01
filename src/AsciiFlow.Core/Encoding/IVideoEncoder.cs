@@ -44,3 +44,12 @@ public interface IVideoEncoder : IDisposable
     /// </summary>
     void Finish();
 }
+
+/// <summary>可选的编码器内部性能指标。</summary>
+public interface IVideoEncoderMetrics
+{
+    double ColorConversionTimeMs { get; }
+    double CodecTimeMs { get; }
+    double MuxTimeMs { get; }
+    double FinishTimeMs { get; }
+}

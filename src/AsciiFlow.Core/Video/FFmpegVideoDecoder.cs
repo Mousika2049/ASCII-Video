@@ -162,8 +162,6 @@ public unsafe class FFmpegVideoDecoder : IVideoDecoder
             _currentFrame = 0;
             _initialized = true;
 
-            // ✓ 使用下划线访问私有字段
-            Console.WriteLine($"[解码器] 初始化成功：{_width}x{_height}, {_frameRate:F2} FPS, {_frameCount} 帧");
         }
         catch (Exception ex)
         {

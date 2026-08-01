@@ -22,4 +22,12 @@ public class CommandLineOptionsTests
 
         Assert.Throws<ArgumentException>(() => options.Color);
     }
+
+    [Fact]
+    public void ProcessingRequestUsesSpeedEncodingByDefault()
+    {
+        var options = new CommandLineOptions();
+
+        Assert.Equal("speed", options.ToProcessingRequest().EncoderMode);
+    }
 }

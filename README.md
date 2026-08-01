@@ -15,7 +15,9 @@
 - 🎵 **原声音频无损透传（Audio Stream Copy）**
   基于 FFmpeg 流复用（Remuxing）技术，在音频编码与 MP4 容器兼容时复制原始音频包。
 - ⚡ **低分配处理流水线**
-  复用解码、灰度、字符、颜色和渲染缓冲区，并通过行级 `Parallel.For` 与预渲染字符缓存减少逐帧开销。
+  在一次源图像遍历中融合灰度计算、字符映射和颜色采样，复用字符、颜色与渲染缓冲区，并通过行级 `Parallel.For` 与预渲染字符缓存减少逐帧开销。
+- 🎞️ **经过样本验证的编码模式**
+  默认 `speed` 使用 `libx264 ultrafast / CRF 20`；也可选择较小文件的 `balanced` 或兼容旧参数的 `quality`。
 - 🐧 **全平台字体兼容（Cross-Platform Font Fallback）**
   内置 Windows / Linux / macOS 自动字体选择降级机制（Consolas ➔ Cascadia Mono ➔ DejaVu Sans Mono ➔ Liberation Mono ➔ Monospace），防止跨平台全黑画面。
 - ⏱️ **智能帧率匹配（Auto Frame Rate）**
@@ -30,11 +32,10 @@
 ```mermaid
 flowchart LR
     A[📹 输入视频] --> B[1. FFmpeg 解码 RGB24]
-    B --> C[2. 并行灰度转换]
-    C --> D[3. S-Curve ASCII & 颜色映射]
-    D --> E[4. SkiaSharp 字符多线程渲染]
-    E --> F[5. H.264 编码 + 音轨透传]
-    F --> G[🎬 最终 ASCII 视频]
+    B --> C[2. BT.709 / 颜色采样 / S-Curve ASCII 融合映射]
+    C --> D[3. SkiaSharp 字符多线程渲染]
+    D --> E[4. H.264 编码 + 音轨透传]
+    E --> F[🎬 最终 ASCII 视频]
 ```
 
 ---
@@ -90,14 +91,25 @@ dotnet run --project src/AsciiFlow.App -- -i input.mp4 -o output.mp4 --max-frame
 | | `--font-family` | `Consolas` | 渲染字体族名称（跨平台自动回退） |
 | | `--font-size` | `12` | 渲染字体大小 (px) |
 | | `--max-frames` | `0` | 最大转换帧数（`0` 表示转换全片） |
-| | `--no-progress` | `false` | 禁用控制台进度条显示 |
-| `-v` | `--verbose` | `false` | 显示详细错误和 FFmpeg 日志 |
+| | `--encoder-mode` | `speed` | 编码模式：`speed`、`balanced` 或 `quality` |
+| | `--no-progress` | `false` | 禁用动态进度条（输出重定向时会自动禁用） |
+| `-v` | `--verbose` | `false` | 显示编码、渲染、性能明细和完整错误诊断 |
 
 ---
 
 ## 📊 性能测量
 
-程序会在每次转换后输出解码、灰度转换、映射、渲染和编码的实际耗时。结果取决于源编码、分辨率、ASCII 网格、字体、CPU 和 FFmpeg 构建，请在目标机器上使用同一输入进行比较，不把单台机器的结果视为通用保证。
+默认终端只显示输入、输出、核心配置、源视频信息、进度和完成摘要。使用 `--verbose` 时，额外显示解码、灰度/颜色融合映射、渲染、RGB→YUV、H.264、视频封装和编码收尾的实际耗时。
+
+编码模式参数：
+
+| 模式 | libx264 参数 | 适用场景 |
+| :--- | :--- | :--- |
+| `speed`（默认） | `ultrafast / CRF 20` | 通过质量门槛的最高吞吐模式，可接受更大的文件 |
+| `balanced` | `superfast / CRF 20` | 视觉质量达标，同时控制文件体积 |
+| `quality` | `fast / CRF 23 / tune fastdecode` | 保留旧版编码参数和较小文件 |
+
+在 120 帧、1920×1080 彩色 ASCII 样本上，默认模式的流水线由旧参数的 72.6 FPS 提升至 92.4 FPS；H.264 子阶段由约 1.99 ms/帧降至 0.96 ms/帧。相同样本的隔离编码测试中，默认模式相对旧参数的综合 SSIM 为 0.9911（旧参数对照为 0.9919），PSNR 为 41.76 dB（旧参数对照为 40.20 dB）。默认模式样本文件为 10.62 MB，`balanced` 为 7.99 MB，`quality` 为 4.66 MB。测试结果取决于源编码、分辨率、ASCII 网格、字体、CPU 和 FFmpeg 构建，请在目标机器上使用同一输入进行比较，不把单台机器的结果视为通用保证。
 
 ---
 
@@ -109,7 +121,7 @@ AsciiFlow/
 │   ├── AsciiFlow.App/             # 命令行应用层 (CLI & Pipeline Orchestration)
 │   └── AsciiFlow.Core/            # 核心领域逻辑库
 │       ├── Video/                 # FFmpeg 解码器与音轨处理
-│       ├── Processing/            # 并行灰度转换
+│       ├── Processing/            # 可独立使用的灰度转换组件
 │       ├── AsciiMapping/          # 灰度到 ASCII 字符与颜色映射器
 │       ├── Rendering/             # SkiaSharp 字符位图渲染引擎
 │       └── Encoding/              # FFmpeg H.264 编码器

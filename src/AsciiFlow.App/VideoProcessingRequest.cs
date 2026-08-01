@@ -14,6 +14,7 @@ public sealed record VideoProcessingRequest
     public float FontSize { get; init; }
     public required string FontFamily { get; init; }
     public int MaxFrames { get; init; }
+    public string EncoderMode { get; init; } = "speed";
     public bool Color { get; init; }
     public bool Verbose { get; init; }
     public bool NoProgress { get; init; }

@@ -14,6 +14,41 @@ public sealed record AsciiFrame(
 /// </summary>
 public interface IAsciiMapper
 {
+    /// <summary>
+    /// 直接从 RGB24 映射字符和可选颜色，在一次源图像遍历中完成灰度计算与单元格聚合。
+    /// </summary>
+    AsciiFrame MapRgb(
+        byte[] rgbData,
+        int width,
+        int height,
+        int targetWidth,
+        int targetHeight,
+        bool includeColor)
+    {
+        ArgumentNullException.ThrowIfNull(rgbData);
+        if (width <= 0 || height <= 0)
+            throw new ArgumentException("RGB 数据尺寸无效", nameof(rgbData));
+        int pixelCount = checked(width * height);
+        if (rgbData.Length != checked(pixelCount * 3))
+            throw new ArgumentException("RGB 数据尺寸无效", nameof(rgbData));
+
+        var grayscale = new byte[pixelCount];
+        for (int pixel = 0, rgbIndex = 0; pixel < pixelCount; pixel++, rgbIndex += 3)
+        {
+            grayscale[pixel] = (byte)((rgbData[rgbIndex] * 54 +
+                                       rgbData[rgbIndex + 1] * 183 +
+                                       rgbData[rgbIndex + 2] * 19) >> 8);
+        }
+
+        return Map(
+            grayscale,
+            width,
+            height,
+            targetWidth,
+            targetHeight,
+            includeColor ? rgbData : null);
+    }
+
     AsciiFrame Map(
         byte[] grayData,
         int width,

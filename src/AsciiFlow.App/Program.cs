@@ -39,7 +39,7 @@ class Program
     /// <summary>
     /// 自动检测并设置 FFmpeg 动态库路径
     /// </summary>
-    private static void SetupFFmpegRootPath()
+    private static void SetupFFmpegRootPath(bool verbose)
     {
         try
         {
@@ -48,21 +48,17 @@ class Program
             if (resolvedPath != null)
             {
                 FFmpeg.AutoGen.ffmpeg.RootPath = resolvedPath;
-                Console.WriteLine($"[FFmpeg] ✓ 动态库路径: {resolvedPath}");
+                if (verbose)
+                    Console.WriteLine($"FFmpeg  {resolvedPath}");
             }
             else
             {
-                // 未找到路径 —— 显示详细帮助
-                Console.ForegroundColor = ConsoleColor.Yellow;
-                Console.WriteLine(FFmpegPathResolver.GetHelpMessage());
-                Console.ResetColor();
+                Console.Error.WriteLine(FFmpegPathResolver.GetHelpMessage());
             }
         }
         catch (Exception ex)
         {
-            Console.ForegroundColor = ConsoleColor.Yellow;
-            Console.WriteLine($"[FFmpeg] ⚠ 路径检测异常: {ex.Message}");
-            Console.ResetColor();
+            Console.Error.WriteLine($"警告    FFmpeg 路径检测失败：{ex.Message}");
         }
     }
 
@@ -76,22 +72,14 @@ class Program
 
         try
         {
-            SetupFFmpegRootPath();
-            Console.WriteLine("╔══════════════════════════════════════════════╗");
-            Console.WriteLine("║     AsciiFlow - ASCII 视频转换器 v1.0.0      ║");
-            Console.WriteLine("╚══════════════════════════════════════════════╝");
-            Console.WriteLine();
-
-            // 打印配置信息
-            PrintConfiguration(options);
+            PrintRequest(options);
+            SetupFFmpegRootPath(options.Verbose);
 
             // 初始化流水线
             VideoProcessingRequest request = options.ToProcessingRequest();
             pipeline.Initialize(request);
 
-            Console.WriteLine();
-            Console.WriteLine("开始处理...");
-            Console.WriteLine(new string('─', 50));
+            Console.WriteLine("处理    正在转换...");
 
             // 处理视频
             int totalFrames = pipeline.Process(request, cancellationToken);
@@ -101,167 +89,95 @@ class Program
 
             stopwatch.Stop();
 
-            // 打印性能报告
             var stats = pipeline.GetStatistics();
-            PrintPerformanceReport(stats, totalFrames, stopwatch);
-
-            Console.WriteLine();
-            Console.WriteLine("╔══════════════════════════════════════════════╗");
-            Console.WriteLine("║              ✅ 处理完成！                    ║");
-            Console.WriteLine("╚══════════════════════════════════════════════╝");
-            Console.WriteLine();
-            Console.WriteLine($"输出文件: {Path.GetFullPath(options.OutputFile)}");
-
-            if (File.Exists(options.OutputFile))
-            {
-                Console.WriteLine($"文件大小: {new FileInfo(options.OutputFile).Length / 1024.0 / 1024.0:F2} MB");
-            }
+            PrintCompletion(options, stats, totalFrames, stopwatch);
 
             return 0;
         }
         catch (OperationCanceledException)
         {
-            Console.WriteLine();
-            Console.WriteLine("处理已取消，未替换原输出文件。");
+            Console.Error.WriteLine("取消    处理已取消，原输出文件未被替换");
             return 130;
         }
         catch (Exception ex)
         {
-            Console.WriteLine();
-            Console.WriteLine($"╔══════════════════════════════════════════════╗");
-            Console.WriteLine($"║  ❌ 处理失败！                                ║");
-            Console.WriteLine($"╚══════════════════════════════════════════════╝");
-            Console.WriteLine();
+            Console.Error.WriteLine($"错误    {ex.Message}");
 
             if (options.Verbose)
             {
-                Console.WriteLine($"错误类型: {ex.GetType().Name}");
-                Console.WriteLine($"错误信息: {ex.Message}");
-                Console.WriteLine();
-                Console.WriteLine("堆栈跟踪:");
-                Console.WriteLine(ex.StackTrace);
+                Console.Error.WriteLine($"类型    {ex.GetType().FullName}");
+                Console.Error.WriteLine(ex.StackTrace);
 
                 if (ex.InnerException != null)
                 {
-                    Console.WriteLine();
-                    Console.WriteLine("内部异常:");
-                    Console.WriteLine($"  类型: {ex.InnerException.GetType().Name}");
-                    Console.WriteLine($"  信息: {ex.InnerException.Message}");
+                    Console.Error.WriteLine(
+                        $"内部    {ex.InnerException.GetType().Name}: {ex.InnerException.Message}");
                 }
             }
             else
             {
-                Console.WriteLine($"错误信息: {ex.Message}");
-                Console.WriteLine();
-                Console.WriteLine("提示: 使用 --verbose 选项查看详细信息");
+                Console.Error.WriteLine("提示    使用 --verbose 查看诊断信息");
             }
 
             return 1;
         }
         finally
         {
-            pipeline?.Dispose();
+            pipeline.Dispose();
         }
     }
 
-    /// <summary>
-    /// 打印配置信息
-    /// </summary>
-    static void PrintConfiguration(CommandLineOptions options)
+    private static void PrintRequest(CommandLineOptions options)
     {
-        Console.WriteLine("【配置信息】");
-        Console.WriteLine($"  输入文件: {options.InputFile}");
-        Console.WriteLine($"  输出文件: {options.OutputFile}");
-        string heightText = options.Height > 0 ? $"{options.Height}" : "自动";
-        Console.WriteLine($"  ASCII 尺寸: {options.Width} × {heightText} 字符");
-        Console.WriteLine($"  输出尺寸: 遵循原视频分辨率");
-        string fpsText = options.FrameRate > 0 ? $"{options.FrameRate} fps" : "自动（与原视频保持一致）";
-        Console.WriteLine($"  帧率: {fpsText}");
-        Console.WriteLine($"  字符集: {options.CharSet}");
-        Console.WriteLine($"  字体: {options.FontFamily} {options.FontSize}px");
-        Console.WriteLine($"  彩色模式: {(options.Color ? "开启" : "关闭")}");
+        string heightText = options.Height > 0 ? options.Height.ToString() : "自动";
+        string maxFramesText = options.MaxFrames > 0 ? $" · 最多 {options.MaxFrames} 帧" : string.Empty;
 
-        if (options.MaxFrames > 0)
+        Console.WriteLine("AsciiFlow 1.0.0");
+        Console.WriteLine($"输入    {Path.GetFullPath(options.InputFile)}");
+        Console.WriteLine($"保存至  {Path.GetFullPath(options.OutputFile)}");
+        Console.WriteLine(
+            $"配置    ASCII {options.Width}x{heightText} · " +
+            $"{(options.Color ? "彩色" : "黑白")} · {options.EncoderMode}{maxFramesText}");
+
+        if (options.Verbose)
         {
-            Console.WriteLine($"  最大帧数: {options.MaxFrames}");
+            string frameRateText = options.FrameRate > 0 ? $"{options.FrameRate:F3} FPS" : "跟随源视频";
+            Console.WriteLine(
+                $"选项    {options.CharSet} · {options.FontFamily} {options.FontSize:F1}px · {frameRateText}");
         }
 
         Console.WriteLine();
-        Console.WriteLine("【处理流水线】");
-        Console.WriteLine("  [解码] FFmpeg → 并行灰度 → ASCII映射 → SkiaSharp渲染 → H.264编码 [输出]");
     }
 
-    /// <summary>
-    /// 打印性能报告
-    /// </summary>
-    static void PrintPerformanceReport(PerformanceStats stats, int totalFrames, Stopwatch stopwatch)
+    private static void PrintCompletion(
+        CommandLineOptions options,
+        PerformanceStats stats,
+        int totalFrames,
+        Stopwatch stopwatch)
+    {
+        double seconds = Math.Max(0.001, stopwatch.Elapsed.TotalSeconds);
+        string outputPath = Path.GetFullPath(options.OutputFile);
+        long? outputBytes = File.Exists(outputPath) ? new FileInfo(outputPath).Length : null;
+
+        Console.WriteLine($"完成    {TerminalDisplay.FormatCompletion(totalFrames, seconds, outputBytes)}");
+        Console.WriteLine($"文件    {outputPath}");
+
+        if (options.Verbose)
+            PrintPerformanceDetails(stats, totalFrames);
+    }
+
+    private static void PrintPerformanceDetails(PerformanceStats stats, int totalFrames)
     {
         Console.WriteLine();
-        Console.WriteLine(new string('═', 50));
-        Console.WriteLine("                    📊 性能报告");
-        Console.WriteLine(new string('═', 50));
-        Console.WriteLine();
-
-        // ====== [修复] 零帧数保护 ======
-        if (totalFrames == 0)
-        {
-            Console.WriteLine("【总览】");
-            Console.WriteLine("  处理帧数: 0 帧");
-            Console.WriteLine("  ⚠️  警告: 未处理任何帧");
-            Console.WriteLine();
-            Console.WriteLine("可能原因：");
-            Console.WriteLine("  • 输入视频为空或无效");
-            Console.WriteLine("  • 解码器未能读取任何帧");
-            Console.WriteLine("  • --max-frames 设置为 0 且视频读取立即失败");
-            return;
-        }
-        // =================================
-
-        double totalSeconds = stopwatch.Elapsed.TotalSeconds;
-        if (totalSeconds <= 0) totalSeconds = 0.001; // 防止除零
-
-        Console.WriteLine($"【总览】");
-        Console.WriteLine($"  处理帧数: {totalFrames} 帧");
-        Console.WriteLine($"  总耗时: {totalSeconds:F2} 秒");
-        Console.WriteLine($"  平均 FPS: {(totalFrames / totalSeconds):F2}");
-        Console.WriteLine();
-
-        Console.WriteLine($"【各阶段耗时】");
-        Console.WriteLine($"  ├─ 解码: {stats.DecodeTimeMs / 1000.0:F3}s ({stats.DecodeTimeMs / (double)totalFrames:F2}ms/帧)");
-        Console.WriteLine($"  ├─ 灰度转换: {stats.GrayscaleTimeMs / 1000.0:F3}s ({stats.GrayscaleTimeMs / (double)totalFrames:F2}ms/帧)");
-        Console.WriteLine($"  ├─ ASCII映射: {stats.MappingTimeMs / 1000.0:F3}s ({stats.MappingTimeMs / (double)totalFrames:F2}ms/帧)");
-        Console.WriteLine($"  ├─ 渲染: {stats.RenderTimeMs / 1000.0:F3}s ({stats.RenderTimeMs / (double)totalFrames:F2}ms/帧)");
-        Console.WriteLine($"  └─ 编码: {stats.EncodeTimeMs / 1000.0:F3}s ({stats.EncodeTimeMs / (double)totalFrames:F2}ms/帧)");
-        Console.WriteLine();
-
-        double avgFrameTime = (stats.DecodeTimeMs + stats.GrayscaleTimeMs +
-                               stats.MappingTimeMs + stats.RenderTimeMs + stats.EncodeTimeMs)
-                              / (double)totalFrames;
-        double theoreticalFps = avgFrameTime > 0 ? 1000.0 / avgFrameTime : 0;
-
-        Console.WriteLine($"【性能评估】");
-        Console.WriteLine($"  单帧平均耗时: {avgFrameTime:F2}ms");
-        Console.WriteLine($"  理论 FPS: {theoreticalFps:F1}");
-        Console.WriteLine();
-
-        if (avgFrameTime <= 30)
-        {
-            Console.WriteLine("  ✅ 当前配置的处理速度高于 30 FPS 实时基准");
-        }
-        else if (avgFrameTime <= 50)
-        {
-            Console.WriteLine("  ✅ 当前配置接近 20–30 FPS");
-        }
-        else if (avgFrameTime <= 100)
-        {
-            Console.WriteLine("  ⚠️  性能一般！建议降低 ASCII 分辨率");
-        }
-        else
-        {
-            Console.WriteLine("  ❌ 性能不足！建议:");
-            Console.WriteLine("     • 降低 ASCII 分辨率（如 40x20）");
-            Console.WriteLine("     • 降低输出帧率（如 15fps）");
-            Console.WriteLine("     • 检查 CPU 性能和 FFmpeg 编解码器");
-        }
+        Console.WriteLine("性能明细（每帧）");
+        Console.WriteLine($"  解码            {stats.DecodeTimeMs / totalFrames,7:F2} ms");
+        Console.WriteLine($"  灰度/颜色映射   {stats.MappingTimeMs / totalFrames,7:F2} ms");
+        Console.WriteLine($"  字符渲染        {stats.RenderTimeMs / totalFrames,7:F2} ms");
+        Console.WriteLine($"  编码总计        {stats.EncodeTimeMs / totalFrames,7:F2} ms");
+        Console.WriteLine($"    RGB → YUV     {stats.ColorConversionTimeMs / totalFrames,7:F2} ms");
+        Console.WriteLine($"    H.264          {stats.CodecTimeMs / totalFrames,7:F2} ms");
+        Console.WriteLine($"    视频封装       {stats.MuxTimeMs / totalFrames,7:F2} ms");
+        Console.WriteLine($"  编码收尾        {stats.EncoderFinishTimeMs,7:F2} ms");
     }
+
 }
