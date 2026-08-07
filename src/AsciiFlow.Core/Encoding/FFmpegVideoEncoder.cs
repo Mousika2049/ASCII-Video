@@ -7,8 +7,8 @@ using FFmpeg.AutoGen;
 namespace AsciiFlow.Core.Encoding;
 
 /// <summary>
-/// 基于 FFmpeg.AutoGen 8.1.0 的 H.264 视频编码器
-/// 性能目标：~20ms/帧（1080p，CRF 23）
+/// 基于 FFmpeg.AutoGen 8.1.0 的多容器视频编码器。
+/// 根据输出扩展名选择容器，WebM 使用 VP9，其他受支持容器使用 H.264。
 /// </summary>
 public unsafe class FFmpegVideoEncoder : IVideoEncoder, IVideoEncoderMetrics
 {
@@ -32,6 +32,7 @@ public unsafe class FFmpegVideoEncoder : IVideoEncoder, IVideoEncoderMetrics
     private bool _disposed;
     private string _outputPath;
     private VideoEncoderSettings _settings = VideoEncoderSettings.Speed;
+    private MediaOutputProfile? _outputProfile;
 
     private double _colorConversionTimeMs;
     private double _codecTimeMs;
@@ -41,9 +42,6 @@ public unsafe class FFmpegVideoEncoder : IVideoEncoder, IVideoEncoderMetrics
     // FFmpeg 错误码常量
     private const int AVERROR_EAGAIN = -11;
     private static readonly int AVERROR_EOF = ffmpeg.AVERROR_EOF;
-
-    // 编码器配置
-    private const string CodecName = "libx264";
 
     /// <summary>编码器是否已初始化</summary>
     public bool IsInitialized => _initialized;
@@ -64,6 +62,9 @@ public unsafe class FFmpegVideoEncoder : IVideoEncoder, IVideoEncoderMetrics
     public double MuxTimeMs => _muxTimeMs;
     public double FinishTimeMs => _finishTimeMs;
     public VideoEncoderSettings Settings => _settings;
+    public MediaOutputProfile OutputProfile => _outputProfile
+        ?? throw new InvalidOperationException("编码器尚未初始化");
+    public bool HasAudioStream => _audioStreamIndex >= 0;
 
     public FFmpegVideoEncoder()
     {
@@ -112,12 +113,13 @@ public unsafe class FFmpegVideoEncoder : IVideoEncoder, IVideoEncoderMetrics
             throw new ArgumentOutOfRangeException($"尺寸不合法: {width}x{height}");
 
         if ((width & 1) != 0 || (height & 1) != 0)
-            throw new ArgumentException($"H.264 YUV420P 输出尺寸必须为偶数: {width}x{height}");
+            throw new ArgumentException($"YUV420P 输出尺寸必须为偶数: {width}x{height}");
 
         if (!frameRate.IsValid)
             throw new ArgumentOutOfRangeException(nameof(frameRate), "帧率必须为正数");
 
         _outputPath = outputPath;
+        _outputProfile = MediaOutputProfile.FromPath(outputPath);
         _audioStreamIndex = -1;
         _width = width;
         _height = height;
@@ -136,20 +138,9 @@ public unsafe class FFmpegVideoEncoder : IVideoEncoder, IVideoEncoderMetrics
             // 2. 创建编码器
             CreateEncoder();
 
-            // 2.5 挂载原视频音频流 (Stream Copy)
+            // 2.5 目标容器未明确拒绝源音频编码时进行流复制。
             if (inAudioStream != null && _formatContext != null)
-            {
-                AVStream* outAudioStream = ffmpeg.avformat_new_stream(_formatContext, null);
-                if (outAudioStream != null)
-                {
-                    int copyRet = ffmpeg.avcodec_parameters_copy(outAudioStream->codecpar, inAudioStream->codecpar);
-                    if (copyRet < 0)
-                        throw new FFmpegEncoderException("无法复制音频流参数", copyRet);
-                    outAudioStream->codecpar->codec_tag = 0;
-                    outAudioStream->time_base = inAudioStream->time_base;
-                    _audioStreamIndex = outAudioStream->index;
-                }
-            }
+                TryAttachAudioStream(inAudioStream);
 
             // 3. 创建 RGB→YUV 格式转换上下文
             CreateSwsContext();
@@ -157,7 +148,7 @@ public unsafe class FFmpegVideoEncoder : IVideoEncoder, IVideoEncoderMetrics
             // 4. 分配 YUV 帧
             AllocateYUVFrame();
 
-            // 5. 写入文件头（MP4 容器头）
+            // 5. 写入容器头
             int headerRet = ffmpeg.avformat_write_header(_formatContext, null);
             if (headerRet < 0)
                 throw new FFmpegEncoderException("无法写入视频文件头", headerRet);
@@ -173,8 +164,46 @@ public unsafe class FFmpegVideoEncoder : IVideoEncoder, IVideoEncoderMetrics
         }
     }
 
+    private void TryAttachAudioStream(AVStream* inAudioStream)
+    {
+        if (_formatContext == null || inAudioStream->codecpar == null)
+            return;
+
+        int compatibility = ffmpeg.avformat_query_codec(
+            _formatContext->oformat,
+            inAudioStream->codecpar->codec_id,
+            ffmpeg.FF_COMPLIANCE_NORMAL);
+        if (compatibility < 0 && !IsKnownMpegTsAudioCodec(inAudioStream->codecpar->codec_id))
+            return;
+
+        AVStream* outAudioStream = ffmpeg.avformat_new_stream(_formatContext, null);
+        if (outAudioStream == null)
+            throw new FFmpegEncoderException("无法创建输出音频流");
+
+        int copyRet = ffmpeg.avcodec_parameters_copy(outAudioStream->codecpar, inAudioStream->codecpar);
+        if (copyRet < 0)
+            throw new FFmpegEncoderException("无法复制音频流参数", copyRet);
+
+        outAudioStream->codecpar->codec_tag = 0;
+        outAudioStream->time_base = inAudioStream->time_base;
+        _audioStreamIndex = outAudioStream->index;
+    }
+
+    private bool IsKnownMpegTsAudioCodec(AVCodecID codecId)
+    {
+        if (!string.Equals(OutputProfile.ContainerFormat, "mpegts", StringComparison.Ordinal))
+            return false;
+
+        return codecId is
+            AVCodecID.AV_CODEC_ID_AAC or
+            AVCodecID.AV_CODEC_ID_MP2 or
+            AVCodecID.AV_CODEC_ID_MP3 or
+            AVCodecID.AV_CODEC_ID_AC3 or
+            AVCodecID.AV_CODEC_ID_EAC3;
+    }
+
     /// <summary>
-    /// 将原音频包透传写入 MP4 容器文件
+    /// 将兼容的原音频包透传写入目标容器
     /// </summary>
     public void WriteAudioPacket(AVPacket* packet, AVStream* inAudioStream)
     {
@@ -204,16 +233,16 @@ public unsafe class FFmpegVideoEncoder : IVideoEncoder, IVideoEncoderMetrics
     }
 
     /// <summary>
-    /// 创建输出格式上下文（MP4 容器）
+    /// 创建输出格式上下文
     /// </summary>
     private void CreateOutputFormatContext()
     {
         AVFormatContext* formatContext = null;
-        // 创建输出格式上下文
+        MediaOutputProfile profile = OutputProfile;
         int ret = ffmpeg.avformat_alloc_output_context2(
             &formatContext,
             null,
-            null,
+            profile.ContainerFormat,
             _outputPath);
 
         if (ret < 0 || formatContext == null)
@@ -236,14 +265,15 @@ public unsafe class FFmpegVideoEncoder : IVideoEncoder, IVideoEncoderMetrics
     }
 
     /// <summary>
-    /// 创建 H.264 编码器
+    /// 创建与目标容器匹配的视频编码器
     /// </summary>
     private void CreateEncoder()
     {
-        // 查找 libx264 编码器
-        AVCodec* codec = ffmpeg.avcodec_find_encoder_by_name(CodecName);
+        MediaOutputProfile profile = OutputProfile;
+        AVCodec* codec = ffmpeg.avcodec_find_encoder_by_name(profile.VideoCodecName);
         if (codec == null)
-            throw new FFmpegEncoderException($"找不到编码器: {CodecName}，请确保 FFmpeg 包含 libx264");
+            throw new FFmpegEncoderException(
+                $"找不到编码器: {profile.VideoCodecName}，请确保 FFmpeg 构建包含该编码器");
 
         // 创建视频流
         AVStream* stream = ffmpeg.avformat_new_stream(_formatContext, null);
@@ -270,18 +300,14 @@ public unsafe class FFmpegVideoEncoder : IVideoEncoder, IVideoEncoderMetrics
 
         // GOP 结构：每 2 秒一个关键帧
         _codecContext->gop_size = (int)(_frameRate * 2);
-        _codecContext->max_b_frames = 2;
-        _codecContext->bit_rate = 4_000_000;  // 4 Mbps 基础码率
+        _codecContext->max_b_frames = profile.IsVp9 ? 0 : 2;
+        _codecContext->bit_rate = profile.IsVp9 ? 0 : 4_000_000;
 
         if ((_formatContext->oformat->flags & ffmpeg.AVFMT_GLOBALHEADER) != 0)
             _codecContext->flags |= ffmpeg.AV_CODEC_FLAG_GLOBAL_HEADER;
 
-        // 设置 H.264 特定选项（CRF + 预设）
         AVDictionary* options = null;
-        SetDictionaryOption(ref options, "preset", _settings.Preset);
-        SetDictionaryOption(ref options, "crf", _settings.Crf.ToString());
-        if (!string.IsNullOrEmpty(_settings.Tune))
-            SetDictionaryOption(ref options, "tune", _settings.Tune);
+        SetCodecOptions(ref options, profile);
 
         // 打开编码器
         int ret = ffmpeg.avcodec_open2(_codecContext, codec, &options);
@@ -289,7 +315,7 @@ public unsafe class FFmpegVideoEncoder : IVideoEncoder, IVideoEncoderMetrics
             ffmpeg.av_dict_free(&options);
 
         if (ret < 0)
-            throw new FFmpegEncoderException($"无法打开编码器: {CodecName}", ret);
+            throw new FFmpegEncoderException($"无法打开编码器: {profile.VideoCodecName}", ret);
 
         // 复制编码参数到流
         ret = ffmpeg.avcodec_parameters_from_context(stream->codecpar, _codecContext);
@@ -298,6 +324,32 @@ public unsafe class FFmpegVideoEncoder : IVideoEncoder, IVideoEncoderMetrics
 
         // 设置流的 time_base
         stream->time_base = _codecContext->time_base;
+    }
+
+    private void SetCodecOptions(ref AVDictionary* options, MediaOutputProfile profile)
+    {
+        SetDictionaryOption(ref options, "crf", _settings.Crf.ToString());
+
+        if (profile.IsVp9)
+        {
+            string deadline = string.Equals(_settings.Mode, "speed", StringComparison.Ordinal)
+                ? "realtime"
+                : "good";
+            string cpuUsed = _settings.Mode switch
+            {
+                "speed" => "8",
+                "balanced" => "6",
+                _ => "4"
+            };
+            SetDictionaryOption(ref options, "deadline", deadline);
+            SetDictionaryOption(ref options, "cpu-used", cpuUsed);
+            SetDictionaryOption(ref options, "row-mt", "1");
+            return;
+        }
+
+        SetDictionaryOption(ref options, "preset", _settings.Preset);
+        if (!string.IsNullOrEmpty(_settings.Tune))
+            SetDictionaryOption(ref options, "tune", _settings.Tune);
     }
 
     /// <summary>
@@ -514,7 +566,7 @@ public unsafe class FFmpegVideoEncoder : IVideoEncoder, IVideoEncoderMetrics
             // 尝试接收 flush 出的包（EOF 是正常的）
             ReceiveAndWritePackets();
 
-            // 2. 写入文件尾（MP4 索引等）- 必须调用！
+            // 2. 写入容器尾部与索引
             int ret = ffmpeg.av_write_trailer(_formatContext);
             if (ret < 0)
                 throw new FFmpegEncoderException("写入视频文件尾失败", ret);

@@ -4,7 +4,7 @@ namespace AsciiFlow.Core.Encoding;
 
 /// <summary>
 /// 视频编码器接口
-/// 将 RGB24 帧数据编码为 H.264 MP4 视频文件
+/// 将 RGB24 帧数据编码为视频文件
 /// </summary>
 public interface IVideoEncoder : IDisposable
 {
@@ -26,7 +26,7 @@ public interface IVideoEncoder : IDisposable
     /// <summary>
     /// 初始化编码器
     /// </summary>
-    /// <param name="outputPath">输出 MP4 文件路径</param>
+    /// <param name="outputPath">输出媒体文件路径</param>
     /// <param name="width">视频宽度（像素）</param>
     /// <param name="height">视频高度（像素）</param>
     /// <param name="frameRate">视频帧率（fps）</param>
@@ -39,7 +39,7 @@ public interface IVideoEncoder : IDisposable
     void EncodeFrame(byte[] rgbData);
 
     /// <summary>
-    /// 完成编码并写入文件尾部（MP4 索引等）
+    /// 完成编码并写入容器尾部与索引
     /// 调用后编码器不可再用，需 Dispose
     /// </summary>
     void Finish();

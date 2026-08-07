@@ -87,6 +87,7 @@ public class VideoPipeline : IDisposable
 
         string inputPath = Path.GetFullPath(request.InputFile);
         _finalOutputPath = Path.GetFullPath(request.OutputFile);
+        MediaOutputProfile outputProfile = MediaOutputProfile.FromPath(_finalOutputPath);
         StringComparison pathComparison = OperatingSystem.IsWindows()
             ? StringComparison.OrdinalIgnoreCase
             : StringComparison.Ordinal;
@@ -167,20 +168,22 @@ public class VideoPipeline : IDisposable
             : videoInfo.ExactFrameRate;
         if (!outputFrameRate.IsValid) outputFrameRate = new VideoFrameRate(30, 1);
 
-        // 4. 初始化 H.264 编码器并挂载原视频音频轨
+        // 4. 初始化与目标容器匹配的编码器，并尝试挂载原音轨
         _encoder = _encoderFactory();
         VideoEncoderSettings encoderSettings = VideoEncoderSettings.FromMode(request.EncoderMode);
         if (_encoder is FFmpegVideoEncoder configurableEncoder)
             configurableEncoder.Configure(encoderSettings);
 
-        bool hasAudio = false;
+        bool sourceHasAudio = false;
+        bool audioCopied = false;
         if (_decoder is FFmpegVideoDecoder ffmpegDecoder && _encoder is FFmpegVideoEncoder ffmpegEncoder)
         {
             unsafe
             {
                 var audioStream = ffmpegDecoder.GetAudioStream();
-                hasAudio = audioStream != null;
+                sourceHasAudio = audioStream != null;
                 ffmpegEncoder.Initialize(_stagingOutputPath, _videoWidth, _videoHeight, outputFrameRate, audioStream);
+                audioCopied = ffmpegEncoder.HasAudioStream;
 
                 ffmpegDecoder.OnAudioPacket = (packet, stream) =>
                 {
@@ -201,12 +204,13 @@ public class VideoPipeline : IDisposable
 
         if (request.Verbose)
         {
-            string tuneText = string.IsNullOrEmpty(encoderSettings.Tune)
-                ? string.Empty
-                : $" · tune {encoderSettings.Tune}";
+            string audioText = audioCopied
+                ? "透传"
+                : sourceHasAudio ? "与目标容器不兼容，已忽略" : "无";
             Console.WriteLine(
-                $"编码    libx264 {encoderSettings.Preset} · CRF {encoderSettings.Crf}{tuneText} · " +
-                $"{outputFrameRate} · 音频{(hasAudio ? "透传" : "无")}");
+                $"编码    {outputProfile.ContainerDisplayName} / {outputProfile.VideoCodecDisplayName} " +
+                $"{outputProfile.FormatEncoderSettings(encoderSettings)} · " +
+                $"{outputFrameRate} · 音频{audioText}");
             Console.WriteLine(
                 $"渲染    {request.CharSet} ({charSet.Length} 字符) · " +
                 $"{request.FontFamily} {fontSize:F1}px · 单元格 {charW}x{charH}");
@@ -371,6 +375,7 @@ public class VideoPipeline : IDisposable
             throw new ArgumentException("输入文件路径不能为空", nameof(request.InputFile));
         if (string.IsNullOrWhiteSpace(request.OutputFile))
             throw new ArgumentException("输出文件路径不能为空", nameof(request.OutputFile));
+        _ = MediaOutputProfile.FromPath(request.OutputFile);
         if (request.Width <= 0 || request.Width > 8192)
             throw new ArgumentOutOfRangeException(nameof(request.Width), "ASCII 宽度必须在 1 到 8192 之间");
         if (request.Height < 0 || request.Height > 8192)

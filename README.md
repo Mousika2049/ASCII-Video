@@ -1,4 +1,4 @@
-# 🌊 AsciiFlow - 高性能全彩 ASCII 视频转换器
+# 🌊 AsciiFlow - 高性能全彩 ASCII 媒体转换器
 
 <p align="center">
   <b>基于 .NET 10、FFmpeg 与 SkiaSharp 的全彩字符视频处理工具</b>
@@ -12,8 +12,12 @@
   支持字符级 RGB 色彩采样与 Alpha 遮罩混合，在保留 ASCII 风格的同时还原主要色彩。
 - 👁️ **人眼感知最佳灰度映射（BT.709 + S-Curve）**
   遵循 ITU-R BT.709 亮度标准，结合 S 曲线 (S-Curve) 伽马对比度增强，明暗细节清晰，高对比度不失真。
+- 🎞️ **多媒体格式支持**
+  输入由 FFmpeg 按内容自动探测，可读取 MP4、MKV、MOV、AVI、WebM、FLV、WMV、M4V、MPEG-TS 等包含视频流的媒体文件。
+- 📦 **多容器输出**
+  支持 MP4、M4V、MOV、MKV、AVI、MPEG-TS 和 WebM；WebM 自动使用 VP9，其他容器使用 H.264。
 - 🎵 **原声音频无损透传（Audio Stream Copy）**
-  基于 FFmpeg 流复用（Remuxing）技术，在音频编码与 MP4 容器兼容时复制原始音频包。
+  音频编码与目标容器兼容时复制原始音频包；不兼容时安全忽略音轨并在详细日志中说明。
 - ⚡ **低分配处理流水线**
   在一次源图像遍历中融合灰度计算、字符映射和颜色采样，复用字符、颜色与渲染缓冲区，并通过行级 `Parallel.For` 与预渲染字符缓存减少逐帧开销。
 - 🎞️ **经过样本验证的编码模式**
@@ -34,7 +38,7 @@ flowchart LR
     A[📹 输入视频] --> B[1. FFmpeg 解码 RGB24]
     B --> C[2. BT.709 / 颜色采样 / S-Curve ASCII 融合映射]
     C --> D[3. SkiaSharp 字符多线程渲染]
-    D --> E[4. H.264 编码 + 音轨透传]
+    D --> E[4. H.264 / VP9 编码 + 兼容音轨透传]
     E --> F[🎬 最终 ASCII 视频]
 ```
 
@@ -65,6 +69,12 @@ dotnet test AsciiFlow.slnx -c Release
 # 最简转换（自动匹配帧率与原视频颜色）
 dotnet run --project src/AsciiFlow.App -- -i input.mp4 -o output.mp4
 
+# MKV 输入并输出 MOV
+dotnet run --project src/AsciiFlow.App -- -i input.mkv -o output.mov
+
+# WebM / VP9 输出
+dotnet run --project src/AsciiFlow.App -- -i input.avi -o output.webm
+
 # 指定字符网格分辨率 (如 160×90 字符)
 dotnet run --project src/AsciiFlow.App -- -i input.mp4 -o output.mp4 -w 160 -h 90
 
@@ -81,8 +91,8 @@ dotnet run --project src/AsciiFlow.App -- -i input.mp4 -o output.mp4 --max-frame
 
 | 短参数 | 长参数 | 默认值 | 说明 |
 | :--- | :--- | :--- | :--- |
-| `-i` | `--input` | **必填** | 输入视频文件路径 |
-| `-o` | `--output` | `output/output_ascii.mp4` | 输出视频文件路径 |
+| `-i` | `--input` | **必填** | 输入媒体文件，格式由 FFmpeg 自动探测 |
+| `-o` | `--output` | `output/output_ascii.mp4` | 输出文件；支持 `mp4/m4v/mov/mkv/avi/ts/m2ts/webm` |
 | `-w` | `--width` | `240` | ASCII 字符画宽度（默认 `240` 字符超高清） |
 | `-h` | `--height` | `0` (自动) | ASCII 字符画高度（`0` 表示根据原视频比例自动计算，16:9 对应 `135`） |
 | `-f` | `--framerate` | `0.0` (自动) | 输出视频帧率（`0` 表示自动与原视频一致） |
@@ -99,15 +109,15 @@ dotnet run --project src/AsciiFlow.App -- -i input.mp4 -o output.mp4 --max-frame
 
 ## 📊 性能测量
 
-默认终端只显示输入、输出、核心配置、源视频信息、进度和完成摘要。使用 `--verbose` 时，额外显示解码、灰度/颜色融合映射、渲染、RGB→YUV、H.264、视频封装和编码收尾的实际耗时。
+默认终端只显示输入、输出、核心配置、源视频信息、进度和完成摘要。使用 `--verbose` 时，额外显示容器、编码器、音轨状态以及各处理阶段的实际耗时。
 
 编码模式参数：
 
-| 模式 | libx264 参数 | 适用场景 |
-| :--- | :--- | :--- |
-| `speed`（默认） | `ultrafast / CRF 20` | 通过质量门槛的最高吞吐模式，可接受更大的文件 |
-| `balanced` | `superfast / CRF 20` | 视觉质量达标，同时控制文件体积 |
-| `quality` | `fast / CRF 23 / tune fastdecode` | 保留旧版编码参数和较小文件 |
+| 模式 | H.264 / libx264 | WebM / VP9 | 适用场景 |
+| :--- | :--- | :--- | :--- |
+| `speed`（默认） | `ultrafast / CRF 20` | `realtime / cpu-used 8 / CRF 20` | 最高吞吐，可接受更大文件 |
+| `balanced` | `superfast / CRF 20` | `good / cpu-used 6 / CRF 20` | 平衡速度与文件体积 |
+| `quality` | `fast / CRF 23 / tune fastdecode` | `good / cpu-used 4 / CRF 23` | 更注重压缩效率 |
 
 在 120 帧、1920×1080 彩色 ASCII 样本上，默认模式的流水线由旧参数的 72.6 FPS 提升至 92.4 FPS；H.264 子阶段由约 1.99 ms/帧降至 0.96 ms/帧。相同样本的隔离编码测试中，默认模式相对旧参数的综合 SSIM 为 0.9911（旧参数对照为 0.9919），PSNR 为 41.76 dB（旧参数对照为 40.20 dB）。默认模式样本文件为 10.62 MB，`balanced` 为 7.99 MB，`quality` 为 4.66 MB。测试结果取决于源编码、分辨率、ASCII 网格、字体、CPU 和 FFmpeg 构建，请在目标机器上使用同一输入进行比较，不把单台机器的结果视为通用保证。
 
@@ -124,7 +134,7 @@ AsciiFlow/
 │       ├── Processing/            # 可独立使用的灰度转换组件
 │       ├── AsciiMapping/          # 灰度到 ASCII 字符与颜色映射器
 │       ├── Rendering/             # SkiaSharp 字符位图渲染引擎
-│       └── Encoding/              # FFmpeg H.264 编码器
+│       └── Encoding/              # FFmpeg 容器选择与 H.264/VP9 编码
 ├── tests/
 │   └── AsciiFlow.Core.Tests/      # 映射、渲染、灰度和帧率测试
 ├── ffmpeg/                        # FFmpeg 原生动态库

@@ -8,10 +8,11 @@ namespace AsciiFlow.App;
 /// </summary>
 public class CommandLineOptions
 {
-    [Option('i', "input", Required = true, HelpText = "输入视频文件路径")]
+    [Option('i', "input", Required = true, HelpText = "输入媒体文件路径（由 FFmpeg 自动探测格式）")]
     public string InputFile { get; set; } = string.Empty;
 
-    [Option('o', "output", Required = false, Default = "output/output_ascii.mp4", HelpText = "输出视频文件路径")]
+    [Option('o', "output", Required = false, Default = "output/output_ascii.mp4",
+        HelpText = "输出媒体文件路径（mp4/m4v/mov/mkv/avi/ts/m2ts/webm）")]
     public string OutputFile { get; set; } = "output/output_ascii.mp4";
 
     [Option('w', "width", Required = false, Default = 240, HelpText = "ASCII 字符画宽度（字符数，默认 240 超高清）")]

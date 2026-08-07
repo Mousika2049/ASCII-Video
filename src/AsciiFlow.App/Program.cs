@@ -3,6 +3,7 @@ using System.Diagnostics;
 using System.IO;
 using CommandLine;
 using AsciiFlow.App.Core;
+using AsciiFlow.Core.Encoding;
 using AsciiFlow.Core.Video;
 
 namespace AsciiFlow.App;
@@ -163,10 +164,16 @@ class Program
         Console.WriteLine($"文件    {outputPath}");
 
         if (options.Verbose)
-            PrintPerformanceDetails(stats, totalFrames);
+            PrintPerformanceDetails(
+                stats,
+                totalFrames,
+                MediaOutputProfile.FromPath(options.OutputFile).VideoCodecDisplayName);
     }
 
-    private static void PrintPerformanceDetails(PerformanceStats stats, int totalFrames)
+    private static void PrintPerformanceDetails(
+        PerformanceStats stats,
+        int totalFrames,
+        string videoCodecDisplayName)
     {
         Console.WriteLine();
         Console.WriteLine("性能明细（每帧）");
@@ -175,7 +182,7 @@ class Program
         Console.WriteLine($"  字符渲染        {stats.RenderTimeMs / totalFrames,7:F2} ms");
         Console.WriteLine($"  编码总计        {stats.EncodeTimeMs / totalFrames,7:F2} ms");
         Console.WriteLine($"    RGB → YUV     {stats.ColorConversionTimeMs / totalFrames,7:F2} ms");
-        Console.WriteLine($"    H.264          {stats.CodecTimeMs / totalFrames,7:F2} ms");
+        Console.WriteLine($"    {videoCodecDisplayName,-15}{stats.CodecTimeMs / totalFrames,7:F2} ms");
         Console.WriteLine($"    视频封装       {stats.MuxTimeMs / totalFrames,7:F2} ms");
         Console.WriteLine($"  编码收尾        {stats.EncoderFinishTimeMs,7:F2} ms");
     }

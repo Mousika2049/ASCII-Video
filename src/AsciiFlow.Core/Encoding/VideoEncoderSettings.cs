@@ -1,7 +1,7 @@
 namespace AsciiFlow.Core.Encoding;
 
 /// <summary>
-/// libx264 编码参数。预设模式均经过 AsciiFlow 的 1080p 彩色与黑白样本验证。
+/// 视频编码质量/速度档位。H.264 使用 preset/tune，VP9 会映射为对应的 deadline/cpu-used。
 /// </summary>
 public sealed record VideoEncoderSettings(
     string Mode,

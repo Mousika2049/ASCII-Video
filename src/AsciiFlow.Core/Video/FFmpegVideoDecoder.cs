@@ -30,14 +30,13 @@ public unsafe class FFmpegVideoDecoder : IVideoDecoder
 
     private byte[]? _frameBuffer;
 
-    // flush 模式标志（用于处理 H.264 解码延迟）
+    // flush 模式标志（用于处理存在帧重排的解码器延迟）
     private bool _inFlushMode = false;
     private bool _packetPending;
 
     // FFmpeg 错误码常量
     private static readonly int AVERROR_EOF = ffmpeg.AVERROR_EOF;
     private const int AVERROR_EAGAIN = -11;
-    private const long AV_TIME_BASE = 1000000;
 
     public int Width => _width;
     public int Height => _height;
@@ -86,11 +85,11 @@ public unsafe class FFmpegVideoDecoder : IVideoDecoder
                 throw new FFmpegDecoderException("无法获取视频流信息", findStreamRet);
 
             // ===== 查找视频流与音频流 =====
-            _streamIndex = FindVideoStream();
+            _streamIndex = FindBestStream(AVMediaType.AVMEDIA_TYPE_VIDEO);
             if (_streamIndex < 0)
                 throw new FFmpegDecoderException("未找到视频流");
 
-            _audioStreamIndex = FindAudioStream();
+            _audioStreamIndex = FindBestStream(AVMediaType.AVMEDIA_TYPE_AUDIO, _streamIndex);
 
             AVStream* videoStream = _formatContext->streams[_streamIndex];
             AVCodecParameters* codecParams = videoStream->codecpar;
@@ -129,8 +128,6 @@ public unsafe class FFmpegVideoDecoder : IVideoDecoder
             // 获取总帧数
             if (videoStream->nb_frames > 0)
                 _frameCount = videoStream->nb_frames;
-            else if (_formatContext->duration > 0 && _frameRate > 0)
-                _frameCount = (long)(_formatContext->duration * _frameRate / AV_TIME_BASE);
             else
                 _frameCount = 0;
 
@@ -183,32 +180,16 @@ public unsafe class FFmpegVideoDecoder : IVideoDecoder
         return _formatContext->streams[_audioStreamIndex];
     }
 
-    private int FindAudioStream()
+    private int FindBestStream(AVMediaType mediaType, int relatedStream = -1)
     {
-        if (_formatContext == null) return -1;
-        for (uint i = 0; i < _formatContext->nb_streams; i++)
-        {
-            AVStream* stream = _formatContext->streams[i];
-            if (stream->codecpar->codec_type == AVMediaType.AVMEDIA_TYPE_AUDIO)
-                return (int)i;
-        }
-        return -1;
-    }
-
-    private int FindVideoStream()
-    {
-        if (_formatContext == null) return -1;
-        for (uint i = 0; i < _formatContext->nb_streams; i++)
-        {
-            AVStream* stream = _formatContext->streams[i];
-            if (stream->codecpar->codec_type == AVMediaType.AVMEDIA_TYPE_VIDEO)
-                return (int)i;
-        }
-        return -1;
+        return _formatContext == null
+            ? -1
+            : ffmpeg.av_find_best_stream(
+                _formatContext, mediaType, -1, relatedStream, null, 0);
     }
 
     // ==================================================================
-    // 核心解码接口（循环式，正确处理 H.264 B 帧延迟）
+    // 核心解码接口（循环式，正确处理帧重排延迟）
     // ==================================================================
 
     public byte[]? GetNextFrame()
