@@ -47,4 +47,32 @@ public class MediaOutputProfileTests
 
         Assert.Equal("realtime · cpu-used 8 · CRF 20", result);
     }
+
+    [Fact]
+    public void FormatEncoderSettings_ShowsZeroBFramesForH264SpeedMode()
+    {
+        MediaOutputProfile profile = MediaOutputProfile.FromPath("output.mp4");
+
+        string result = profile.FormatEncoderSettings(VideoEncoderSettings.Speed);
+
+        Assert.Equal("ultrafast · CRF 20 · 0 B 帧", result);
+    }
+
+    [Theory]
+    [InlineData(1, false, true)]
+    [InlineData(0, false, false)]
+    [InlineData(-1, false, false)]
+    [InlineData(0, true, true)]
+    [InlineData(-1, true, true)]
+    public void AudioStreamCopyRequiresConfirmedSupportOrKnownContainerException(
+        int compatibility,
+        bool knownContainerCodecException,
+        bool expected)
+    {
+        Assert.Equal(
+            expected,
+            FFmpegVideoEncoder.ShouldAttachAudioStream(
+                compatibility,
+                knownContainerCodecException));
+    }
 }

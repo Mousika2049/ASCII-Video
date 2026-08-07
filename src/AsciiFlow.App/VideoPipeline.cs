@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Threading.Channels;
 using AsciiFlow.Core.AsciiMapping;
 using AsciiFlow.Core.Encoding;
 using AsciiFlow.Core.Processing;
@@ -13,6 +14,8 @@ namespace AsciiFlow.App.Core;
 /// </summary>
 public class VideoPipeline : IDisposable
 {
+    internal const int PipelineBufferCount = 3;
+
     private readonly Func<IVideoDecoder> _decoderFactory;
     private readonly Func<string, IAsciiMapper> _asciiMapperFactory;
     private readonly Func<CharacterSetConfig, int, int, int, int, IAsciiRenderer> _rendererFactory;
@@ -176,6 +179,7 @@ public class VideoPipeline : IDisposable
 
         bool sourceHasAudio = false;
         bool audioCopied = false;
+        Vp9EncoderTuning? vp9Tuning = null;
         if (_decoder is FFmpegVideoDecoder ffmpegDecoder && _encoder is FFmpegVideoEncoder ffmpegEncoder)
         {
             unsafe
@@ -184,6 +188,7 @@ public class VideoPipeline : IDisposable
                 sourceHasAudio = audioStream != null;
                 ffmpegEncoder.Initialize(_stagingOutputPath, _videoWidth, _videoHeight, outputFrameRate, audioStream);
                 audioCopied = ffmpegEncoder.HasAudioStream;
+                vp9Tuning = ffmpegEncoder.Vp9Tuning;
 
                 ffmpegDecoder.OnAudioPacket = (packet, stream) =>
                 {
@@ -207,13 +212,17 @@ public class VideoPipeline : IDisposable
             string audioText = audioCopied
                 ? "透传"
                 : sourceHasAudio ? "与目标容器不兼容，已忽略" : "无";
+            string vp9Parallelism = vp9Tuning is null
+                ? string.Empty
+                : $" · {vp9Tuning.ThreadCount} 线程/{vp9Tuning.TileCount} 分块";
             Console.WriteLine(
                 $"编码    {outputProfile.ContainerDisplayName} / {outputProfile.VideoCodecDisplayName} " +
                 $"{outputProfile.FormatEncoderSettings(encoderSettings)} · " +
-                $"{outputFrameRate} · 音频{audioText}");
+                $"{outputFrameRate}{vp9Parallelism} · 音频{audioText}");
             Console.WriteLine(
                 $"渲染    {request.CharSet} ({charSet.Length} 字符) · " +
                 $"{request.FontFamily} {fontSize:F1}px · 单元格 {charW}x{charH}");
+            Console.WriteLine($"流水线  {PipelineBufferCount} 槽有界缓冲 · 解码/渲染/编码并行");
         }
     }
 
@@ -234,76 +243,33 @@ public class VideoPipeline : IDisposable
 
         int srcWidth = _decoder.Width;   // 原始视频宽度（如 1280）
         int srcHeight = _decoder.Height; // 原始视频高度（如 720）
+        IYuv420pAsciiRenderer yuvRenderer = _renderer as IYuv420pAsciiRenderer
+            ?? throw new InvalidOperationException("当前渲染器不支持直接 YUV420P 输出");
+        IYuv420pVideoEncoder yuvEncoder = _encoder as IYuv420pVideoEncoder
+            ?? throw new InvalidOperationException("当前编码器不支持直接 YUV420P 输入");
 
         bool showProgress = !request.NoProgress && !Console.IsOutputRedirected;
         var progressSw = showProgress ? Stopwatch.StartNew() : null;
         int lastProgress = 0;
         int lastProgressLineLength = 0;
 
-        while (true)
+        int decodedFrameBytes = checked(srcWidth * srcHeight * 3);
+        int encodedFrameBytes = Yuv420pBuffer.GetSize(_videoWidth, _videoHeight);
+        var availableSlots = CreateBoundedChannel(singleWriter: false);
+        var decodedFrames = CreateBoundedChannel(singleWriter: true);
+        var renderedFrames = CreateBoundedChannel(singleWriter: true);
+        for (int index = 0; index < PipelineBufferCount; index++)
         {
-            cancellationToken.ThrowIfCancellationRequested();
-
-            if (maxFrames.HasValue && totalFrames >= maxFrames.Value)
-                break;
-
-            // ① 解码一帧 (~30ms)
-            var sw = Stopwatch.StartNew();
-            byte[]? rgbFrame = _decoder.GetNextFrame();
-            _decodeTimeMs += sw.Elapsed.TotalMilliseconds;
-
-            if (rgbFrame == null)
-                break; // 视频结束
-
-            // ② RGB24 → 灰度/颜色融合映射；不再生成和遍历整帧灰度缓冲区
-            sw.Restart();
-            byte[] renderedFrame;
-            AsciiFrame asciiFrame = _asciiMapper.MapRgb(
-                rgbFrame,
-                srcWidth,
-                srcHeight,
-                _asciiWidth,
-                _asciiHeight,
-                request.Color);
-            _mappingTimeMs += sw.Elapsed.TotalMilliseconds;
-
-            // ③ ASCII cells + Colors → RGB24 image
-            sw.Restart();
-            renderedFrame = _renderer.RenderFrame(asciiFrame, request.Color);
-            _renderTimeMs += sw.Elapsed.TotalMilliseconds;
-
-            // ④ RGB24 → H.264 packet (~20ms, libx264)
-            sw.Restart();
-            _encoder.EncodeFrame(renderedFrame);
-            _encodeTimeMs += sw.Elapsed.TotalMilliseconds;
-
-            totalFrames++;
-
-            // 进度显示（每秒一次）
-            if (showProgress && progressSw!.ElapsedMilliseconds >= 1000)
-            {
-                double elapsedSeconds = Math.Max(0.001, progressSw.Elapsed.TotalSeconds);
-                progressSw.Restart();
-                int framesThisSec = totalFrames - lastProgress;
-                lastProgress = totalFrames;
-
-                double progress = estimatedTotalFrames > 0
-                    ? Math.Min(100, (double)totalFrames / estimatedTotalFrames.Value * 100)
-                    : 0;
-                double fps = framesThisSec / elapsedSeconds;
-
-                int barWidth = 30;
-                int filled = (int)(progress / 100 * barWidth);
-                string bar = new string('█', filled) + new string('░', barWidth - filled);
-
-                string progressLine =
-                    $"处理    [{bar}] {progress,5:F1}% · " +
-                    $"{totalFrames}/{(estimatedTotalFrames > 0 ? estimatedTotalFrames.ToString() : "?")} 帧 · " +
-                    $"{fps:F0} FPS";
-                Console.Write($"\r{progressLine.PadRight(lastProgressLineLength)}");
-                lastProgressLineLength = Math.Max(lastProgressLineLength, progressLine.Length);
-            }
+            availableSlots.Writer.TryWrite(new FrameBufferSlot(decodedFrameBytes, encodedFrameBytes));
         }
+
+        using var pipelineCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        CancellationToken pipelineToken = pipelineCancellation.Token;
+
+        Task decodeTask = Task.Run(DecodeFramesAsync, CancellationToken.None);
+        Task renderTask = Task.Run(RenderFramesAsync, CancellationToken.None);
+        Task encodeTask = Task.Run(EncodeFramesAsync, CancellationToken.None);
+        Task.WhenAll(decodeTask, renderTask, encodeTask).GetAwaiter().GetResult();
 
         if (showProgress && lastProgressLineLength > 0)
             Console.Write($"\r{new string(' ', lastProgressLineLength)}\r");
@@ -312,6 +278,172 @@ public class VideoPipeline : IDisposable
             throw new InvalidOperationException("未从输入文件解码到任何视频帧");
 
         return totalFrames;
+
+        static Channel<FrameBufferSlot> CreateBoundedChannel(bool singleWriter) =>
+            Channel.CreateBounded<FrameBufferSlot>(new BoundedChannelOptions(PipelineBufferCount)
+            {
+                FullMode = BoundedChannelFullMode.Wait,
+                SingleReader = true,
+                SingleWriter = singleWriter,
+                AllowSynchronousContinuations = false
+            });
+
+        async Task DecodeFramesAsync()
+        {
+            try
+            {
+                int decodedCount = 0;
+                while (!maxFrames.HasValue || decodedCount < maxFrames.Value)
+                {
+                    pipelineToken.ThrowIfCancellationRequested();
+                    FrameBufferSlot slot = await availableSlots.Reader.ReadAsync(pipelineToken);
+                    bool handedOff = false;
+                    try
+                    {
+                        long started = Stopwatch.GetTimestamp();
+                        byte[]? decoded = _decoder.GetNextFrame();
+                        _decodeTimeMs += Stopwatch.GetElapsedTime(started).TotalMilliseconds;
+                        if (decoded is null)
+                            break;
+                        if (decoded.Length != decodedFrameBytes)
+                        {
+                            throw new InvalidOperationException(
+                                $"解码帧长度错误：期望 {decodedFrameBytes}，实际 {decoded.Length}");
+                        }
+
+                        Buffer.BlockCopy(decoded, 0, slot.DecodedRgb, 0, decodedFrameBytes);
+                        await decodedFrames.Writer.WriteAsync(slot, pipelineToken);
+                        handedOff = true;
+                        decodedCount++;
+                    }
+                    finally
+                    {
+                        if (!handedOff)
+                            availableSlots.Writer.TryWrite(slot);
+                    }
+                }
+            }
+            catch
+            {
+                pipelineCancellation.Cancel();
+                throw;
+            }
+            finally
+            {
+                decodedFrames.Writer.TryComplete();
+            }
+        }
+
+        async Task RenderFramesAsync()
+        {
+            try
+            {
+                await foreach (FrameBufferSlot slot in decodedFrames.Reader.ReadAllAsync(pipelineToken))
+                {
+                    bool handedOff = false;
+                    try
+                    {
+                        long started = Stopwatch.GetTimestamp();
+                        AsciiFrame asciiFrame = _asciiMapper.MapRgb(
+                            slot.DecodedRgb,
+                            srcWidth,
+                            srcHeight,
+                            _asciiWidth,
+                            _asciiHeight,
+                            request.Color);
+                        _mappingTimeMs += Stopwatch.GetElapsedTime(started).TotalMilliseconds;
+
+                        started = Stopwatch.GetTimestamp();
+                        yuvRenderer.RenderFrameYuv420p(asciiFrame, slot.EncodedYuv420p, request.Color);
+                        _renderTimeMs += Stopwatch.GetElapsedTime(started).TotalMilliseconds;
+
+                        await renderedFrames.Writer.WriteAsync(slot, pipelineToken);
+                        handedOff = true;
+                    }
+                    finally
+                    {
+                        if (!handedOff)
+                            availableSlots.Writer.TryWrite(slot);
+                    }
+                }
+            }
+            catch
+            {
+                pipelineCancellation.Cancel();
+                throw;
+            }
+            finally
+            {
+                renderedFrames.Writer.TryComplete();
+            }
+        }
+
+        async Task EncodeFramesAsync()
+        {
+            try
+            {
+                await foreach (FrameBufferSlot slot in renderedFrames.Reader.ReadAllAsync(pipelineToken))
+                {
+                    try
+                    {
+                        long started = Stopwatch.GetTimestamp();
+                        yuvEncoder.EncodeYuv420pFrame(slot.EncodedYuv420p);
+                        _encodeTimeMs += Stopwatch.GetElapsedTime(started).TotalMilliseconds;
+                        totalFrames++;
+                        UpdateProgress();
+                    }
+                    finally
+                    {
+                        availableSlots.Writer.TryWrite(slot);
+                    }
+                }
+            }
+            catch
+            {
+                pipelineCancellation.Cancel();
+                throw;
+            }
+        }
+
+        void UpdateProgress()
+        {
+            if (!showProgress || progressSw!.ElapsedMilliseconds < 1000)
+                return;
+
+            double elapsedSeconds = Math.Max(0.001, progressSw.Elapsed.TotalSeconds);
+            progressSw.Restart();
+            int framesThisSec = totalFrames - lastProgress;
+            lastProgress = totalFrames;
+
+            double progress = estimatedTotalFrames > 0
+                ? Math.Min(100, (double)totalFrames / estimatedTotalFrames.Value * 100)
+                : 0;
+            double fps = framesThisSec / elapsedSeconds;
+
+            const int barWidth = 30;
+            int filled = (int)(progress / 100 * barWidth);
+            string bar = new string('█', filled) + new string('░', barWidth - filled);
+            string progressLine =
+                $"处理    [{bar}] {progress,5:F1}% · " +
+                $"{totalFrames}/{(estimatedTotalFrames > 0 ? estimatedTotalFrames.ToString() : "?")} 帧 · " +
+                $"{fps:F0} FPS";
+            Console.Write($"\r{progressLine.PadRight(lastProgressLineLength)}");
+            lastProgressLineLength = Math.Max(lastProgressLineLength, progressLine.Length);
+        }
+    }
+
+    private sealed class FrameBufferSlot
+    {
+        public FrameBufferSlot(int decodedFrameBytes, int encodedFrameBytes)
+        {
+            DecodedRgb = new byte[decodedFrameBytes];
+            EncodedYuv420p = decodedFrameBytes == encodedFrameBytes
+                ? DecodedRgb
+                : new byte[encodedFrameBytes];
+        }
+
+        public byte[] DecodedRgb { get; }
+        public byte[] EncodedYuv420p { get; }
     }
     // ─────────────────────────────────────────
     // 完成编码
@@ -404,6 +536,7 @@ public record PerformanceStats
     public double MappingTimeMs { get; init; }
     public double RenderTimeMs { get; init; }
     public double EncodeTimeMs { get; init; }
+    /// <summary>兼容旧名；直接 YUV 路径中表示将 YUV 帧装载到编码器的时间。</summary>
     public double ColorConversionTimeMs { get; init; }
     public double CodecTimeMs { get; init; }
     public double MuxTimeMs { get; init; }

@@ -10,7 +10,7 @@ namespace AsciiFlow.Core.Encoding;
 /// 基于 FFmpeg.AutoGen 8.1.0 的多容器视频编码器。
 /// 根据输出扩展名选择容器，WebM 使用 VP9，其他受支持容器使用 H.264。
 /// </summary>
-public unsafe class FFmpegVideoEncoder : IVideoEncoder, IVideoEncoderMetrics
+public unsafe class FFmpegVideoEncoder : IVideoEncoder, IYuv420pVideoEncoder, IVideoEncoderMetrics
 {
     // FFmpeg 上下文
     private AVFormatContext* _formatContext;
@@ -33,6 +33,8 @@ public unsafe class FFmpegVideoEncoder : IVideoEncoder, IVideoEncoderMetrics
     private string _outputPath;
     private VideoEncoderSettings _settings = VideoEncoderSettings.Speed;
     private MediaOutputProfile? _outputProfile;
+    private Vp9EncoderTuning? _vp9Tuning;
+    private readonly object _muxLock = new();
 
     private double _colorConversionTimeMs;
     private double _codecTimeMs;
@@ -65,6 +67,7 @@ public unsafe class FFmpegVideoEncoder : IVideoEncoder, IVideoEncoderMetrics
     public MediaOutputProfile OutputProfile => _outputProfile
         ?? throw new InvalidOperationException("编码器尚未初始化");
     public bool HasAudioStream => _audioStreamIndex >= 0;
+    public Vp9EncoderTuning? Vp9Tuning => _vp9Tuning;
 
     public FFmpegVideoEncoder()
     {
@@ -81,6 +84,8 @@ public unsafe class FFmpegVideoEncoder : IVideoEncoder, IVideoEncoderMetrics
             throw new ArgumentOutOfRangeException(nameof(settings), "CRF 必须在 0 到 51 之间");
         if (string.IsNullOrWhiteSpace(_settings.Preset))
             throw new ArgumentException("编码预设不能为空", nameof(settings));
+        if (_settings.MaxBFrames is < 0 or > 16)
+            throw new ArgumentOutOfRangeException(nameof(settings), "B 帧数必须在 0 到 16 之间");
     }
 
     private int _audioStreamIndex = -1;
@@ -120,6 +125,7 @@ public unsafe class FFmpegVideoEncoder : IVideoEncoder, IVideoEncoderMetrics
 
         _outputPath = outputPath;
         _outputProfile = MediaOutputProfile.FromPath(outputPath);
+        _vp9Tuning = null;
         _audioStreamIndex = -1;
         _width = width;
         _height = height;
@@ -142,13 +148,10 @@ public unsafe class FFmpegVideoEncoder : IVideoEncoder, IVideoEncoderMetrics
             if (inAudioStream != null && _formatContext != null)
                 TryAttachAudioStream(inAudioStream);
 
-            // 3. 创建 RGB→YUV 格式转换上下文
-            CreateSwsContext();
-
-            // 4. 分配 YUV 帧
+            // 3. 分配 YUV 帧；RGB 兼容路径的转换上下文按需创建
             AllocateYUVFrame();
 
-            // 5. 写入容器头
+            // 4. 写入容器头
             int headerRet = ffmpeg.avformat_write_header(_formatContext, null);
             if (headerRet < 0)
                 throw new FFmpegEncoderException("无法写入视频文件头", headerRet);
@@ -173,7 +176,8 @@ public unsafe class FFmpegVideoEncoder : IVideoEncoder, IVideoEncoderMetrics
             _formatContext->oformat,
             inAudioStream->codecpar->codec_id,
             ffmpeg.FF_COMPLIANCE_NORMAL);
-        if (compatibility < 0 && !IsKnownMpegTsAudioCodec(inAudioStream->codecpar->codec_id))
+        bool knownMpegTsCodec = IsKnownMpegTsAudioCodec(inAudioStream->codecpar->codec_id);
+        if (!ShouldAttachAudioStream(compatibility, knownMpegTsCodec))
             return;
 
         AVStream* outAudioStream = ffmpeg.avformat_new_stream(_formatContext, null);
@@ -188,6 +192,11 @@ public unsafe class FFmpegVideoEncoder : IVideoEncoder, IVideoEncoderMetrics
         outAudioStream->time_base = inAudioStream->time_base;
         _audioStreamIndex = outAudioStream->index;
     }
+
+    internal static bool ShouldAttachAudioStream(
+        int compatibility,
+        bool knownContainerCodecException) =>
+        compatibility > 0 || knownContainerCodecException;
 
     private bool IsKnownMpegTsAudioCodec(AVCodecID codecId)
     {
@@ -222,7 +231,11 @@ public unsafe class FFmpegVideoEncoder : IVideoEncoder, IVideoEncoderMetrics
         try
         {
             ffmpeg.av_packet_rescale_ts(outPacket, inAudioStream->time_base, outAudioStream->time_base);
-            int writeRet = ffmpeg.av_interleaved_write_frame(_formatContext, outPacket);
+            int writeRet;
+            lock (_muxLock)
+            {
+                writeRet = ffmpeg.av_interleaved_write_frame(_formatContext, outPacket);
+            }
             if (writeRet < 0)
                 throw new FFmpegEncoderException("写入音频包失败", writeRet);
         }
@@ -289,6 +302,10 @@ public unsafe class FFmpegVideoEncoder : IVideoEncoder, IVideoEncoderMetrics
         _codecContext->width = _width;
         _codecContext->height = _height;
         _codecContext->pix_fmt = AVPixelFormat.AV_PIX_FMT_YUV420P;
+        _codecContext->color_range = AVColorRange.AVCOL_RANGE_MPEG;
+        _codecContext->colorspace = AVColorSpace.AVCOL_SPC_BT709;
+        _codecContext->color_primaries = AVColorPrimaries.AVCOL_PRI_BT709;
+        _codecContext->color_trc = AVColorTransferCharacteristic.AVCOL_TRC_BT709;
         _codecContext->framerate = new AVRational
         {
             num = _exactFrameRate.Numerator,
@@ -300,8 +317,18 @@ public unsafe class FFmpegVideoEncoder : IVideoEncoder, IVideoEncoderMetrics
 
         // GOP 结构：每 2 秒一个关键帧
         _codecContext->gop_size = (int)(_frameRate * 2);
-        _codecContext->max_b_frames = profile.IsVp9 ? 0 : 2;
+        _codecContext->max_b_frames = ResolveMaxBFrames(_settings, profile.IsVp9);
         _codecContext->bit_rate = profile.IsVp9 ? 0 : 4_000_000;
+
+        if (profile.IsVp9)
+        {
+            _vp9Tuning = Vp9EncoderTuning.Create(
+                _settings,
+                _width,
+                _height,
+                Environment.ProcessorCount);
+            _codecContext->thread_count = _vp9Tuning.ThreadCount;
+        }
 
         if ((_formatContext->oformat->flags & ffmpeg.AVFMT_GLOBALHEADER) != 0)
             _codecContext->flags |= ffmpeg.AV_CODEC_FLAG_GLOBAL_HEADER;
@@ -332,24 +359,27 @@ public unsafe class FFmpegVideoEncoder : IVideoEncoder, IVideoEncoderMetrics
 
         if (profile.IsVp9)
         {
-            string deadline = string.Equals(_settings.Mode, "speed", StringComparison.Ordinal)
-                ? "realtime"
-                : "good";
-            string cpuUsed = _settings.Mode switch
-            {
-                "speed" => "8",
-                "balanced" => "6",
-                _ => "4"
-            };
-            SetDictionaryOption(ref options, "deadline", deadline);
-            SetDictionaryOption(ref options, "cpu-used", cpuUsed);
+            Vp9EncoderTuning tuning = _vp9Tuning
+                ?? throw new InvalidOperationException("VP9 调优参数尚未初始化");
+            SetDictionaryOption(ref options, "deadline", tuning.Deadline);
+            SetDictionaryOption(ref options, "cpu-used", tuning.CpuUsed.ToString());
             SetDictionaryOption(ref options, "row-mt", "1");
+            SetDictionaryOption(ref options, "tile-columns", tuning.TileColumns.ToString());
+            SetDictionaryOption(ref options, "frame-parallel", "1");
+            if (tuning.LagInFrames.HasValue)
+                SetDictionaryOption(ref options, "lag-in-frames", tuning.LagInFrames.Value.ToString());
             return;
         }
 
         SetDictionaryOption(ref options, "preset", _settings.Preset);
         if (!string.IsNullOrEmpty(_settings.Tune))
             SetDictionaryOption(ref options, "tune", _settings.Tune);
+    }
+
+    internal static int ResolveMaxBFrames(VideoEncoderSettings settings, bool isVp9)
+    {
+        ArgumentNullException.ThrowIfNull(settings);
+        return isVp9 ? 0 : settings.MaxBFrames;
     }
 
     /// <summary>
@@ -379,6 +409,22 @@ public unsafe class FFmpegVideoEncoder : IVideoEncoder, IVideoEncoderMetrics
 
         if (_swsContext == null)
             throw new FFmpegEncoderException("无法创建格式转换上下文");
+
+        int* coefficients = ffmpeg.sws_getCoefficients(ffmpeg.SWS_CS_ITU709);
+        int_array4 colorMatrix = default;
+        for (uint index = 0; index < 4; index++)
+            colorMatrix[index] = coefficients[index];
+        int colorspaceRet = ffmpeg.sws_setColorspaceDetails(
+            _swsContext,
+            in colorMatrix,
+            0,
+            in colorMatrix,
+            0,
+            0,
+            1 << 16,
+            1 << 16);
+        if (colorspaceRet < 0)
+            throw new FFmpegEncoderException("无法设置 BT.709 格式转换参数", colorspaceRet);
     }
 
     /// <summary>
@@ -394,6 +440,10 @@ public unsafe class FFmpegVideoEncoder : IVideoEncoder, IVideoEncoderMetrics
         _yuvFrame->width = _width;
         _yuvFrame->height = _height;
         _yuvFrame->time_base = _codecContext->time_base;
+        _yuvFrame->color_range = AVColorRange.AVCOL_RANGE_MPEG;
+        _yuvFrame->colorspace = AVColorSpace.AVCOL_SPC_BT709;
+        _yuvFrame->color_primaries = AVColorPrimaries.AVCOL_PRI_BT709;
+        _yuvFrame->color_trc = AVColorTransferCharacteristic.AVCOL_TRC_BT709;
 
         // 分配帧缓冲区
         int bufferSize = ffmpeg.av_image_get_buffer_size(
@@ -447,12 +497,37 @@ public unsafe class FFmpegVideoEncoder : IVideoEncoder, IVideoEncoderMetrics
         ConvertRGBToYUV(rgbData);
         _colorConversionTimeMs += Stopwatch.GetElapsedTime(startTimestamp).TotalMilliseconds;
 
-        // 2. 设置帧时间戳
+        EncodePreparedFrame();
+    }
+
+    /// <summary>
+    /// 直接编码连续平面 YUV420P 数据，不调用 swscale。
+    /// </summary>
+    public void EncodeYuv420pFrame(byte[] yuvData)
+    {
+        if (!_initialized)
+            throw new InvalidOperationException("编码器未初始化");
+
+        Yuv420pBuffer.Validate(yuvData, _width, _height, nameof(yuvData));
+        long startTimestamp = Stopwatch.GetTimestamp();
+        fixed (byte* source = yuvData)
+        {
+            long bufferSize = yuvData.LongLength;
+            Buffer.MemoryCopy(source, _yuvBuffer, bufferSize, bufferSize);
+        }
+        _colorConversionTimeMs += Stopwatch.GetElapsedTime(startTimestamp).TotalMilliseconds;
+
+        EncodePreparedFrame();
+    }
+
+    private void EncodePreparedFrame()
+    {
+        // 设置帧时间戳
         _yuvFrame->pts = _encodedFrames;
         _encodedFrames++;
 
-        // 3. 发送到编码器
-        startTimestamp = Stopwatch.GetTimestamp();
+        // 发送到编码器
+        long startTimestamp = Stopwatch.GetTimestamp();
         int sendRet = ffmpeg.avcodec_send_frame(_codecContext, _yuvFrame);
         _codecTimeMs += Stopwatch.GetElapsedTime(startTimestamp).TotalMilliseconds;
         if (sendRet == AVERROR_EAGAIN)
@@ -466,7 +541,7 @@ public unsafe class FFmpegVideoEncoder : IVideoEncoder, IVideoEncoderMetrics
         if (sendRet < 0)
             throw new FFmpegEncoderException("发送帧到编码器失败", sendRet);
 
-        // 4. 接收并写入编码包
+        // 接收并写入编码包
         ReceiveAndWritePackets();
     }
 
@@ -476,6 +551,9 @@ public unsafe class FFmpegVideoEncoder : IVideoEncoder, IVideoEncoderMetrics
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private void ConvertRGBToYUV(byte[] rgbData)
     {
+        if (_swsContext == null)
+            CreateSwsContext();
+
         fixed (byte* rgbPtr = rgbData)
         {
             // 构造源数据指针数组
@@ -539,7 +617,11 @@ public unsafe class FFmpegVideoEncoder : IVideoEncoder, IVideoEncoderMetrics
 
         // 写入容器
         long startTimestamp = Stopwatch.GetTimestamp();
-        int ret = ffmpeg.av_interleaved_write_frame(_formatContext, _packet);
+        int ret;
+        lock (_muxLock)
+        {
+            ret = ffmpeg.av_interleaved_write_frame(_formatContext, _packet);
+        }
         _muxTimeMs += Stopwatch.GetElapsedTime(startTimestamp).TotalMilliseconds;
         if (ret < 0)
             throw new FFmpegEncoderException("写入视频包失败", ret);

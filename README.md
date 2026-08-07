@@ -18,10 +18,10 @@
   支持 MP4、M4V、MOV、MKV、AVI、MPEG-TS 和 WebM；WebM 自动使用 VP9，其他容器使用 H.264。
 - 🎵 **原声音频无损透传（Audio Stream Copy）**
   音频编码与目标容器兼容时复制原始音频包；不兼容时安全忽略音轨并在详细日志中说明。
-- ⚡ **低分配处理流水线**
-  在一次源图像遍历中融合灰度计算、字符映射和颜色采样，复用字符、颜色与渲染缓冲区，并通过行级 `Parallel.For` 与预渲染字符缓存减少逐帧开销。
+- ⚡ **三槽有界处理流水线**
+  解码、映射/渲染与编码三阶段重叠执行；三个循环复用的帧槽控制内存上界。渲染器直接写入 YUV420P，不再生成整帧 RGB24 中间图像；单帧内融合灰度计算、字符映射和颜色采样。
 - 🎞️ **经过样本验证的编码模式**
-  默认 `speed` 使用 `libx264 ultrafast / CRF 20`；也可选择较小文件的 `balanced` 或兼容旧参数的 `quality`。
+  默认 `speed` 使用 `libx264 ultrafast / CRF 20 / 0 B 帧`；也可选择较小文件的 `balanced` 或兼容旧参数的 `quality`。
 - 🐧 **全平台字体兼容（Cross-Platform Font Fallback）**
   内置 Windows / Linux / macOS 自动字体选择降级机制（Consolas ➔ Cascadia Mono ➔ DejaVu Sans Mono ➔ Liberation Mono ➔ Monospace），防止跨平台全黑画面。
 - ⏱️ **智能帧率匹配（Auto Frame Rate）**
@@ -36,9 +36,9 @@
 ```mermaid
 flowchart LR
     A[📹 输入视频] --> B[1. FFmpeg 解码 RGB24]
-    B --> C[2. BT.709 / 颜色采样 / S-Curve ASCII 融合映射]
-    C --> D[3. SkiaSharp 字符多线程渲染]
-    D --> E[4. H.264 / VP9 编码 + 兼容音轨透传]
+    B -->|3 槽有界缓冲| C[2. BT.709 / 颜色采样 / S-Curve ASCII 融合映射]
+    C --> D[3. 字符多线程直接渲染 YUV420P]
+    D -->|3 槽有界缓冲| E[4. H.264 / VP9 直接编码 + 兼容音轨透传]
     E --> F[🎬 最终 ASCII 视频]
 ```
 
@@ -115,9 +115,11 @@ dotnet run --project src/AsciiFlow.App -- -i input.mp4 -o output.mp4 --max-frame
 
 | 模式 | H.264 / libx264 | WebM / VP9 | 适用场景 |
 | :--- | :--- | :--- | :--- |
-| `speed`（默认） | `ultrafast / CRF 20` | `realtime / cpu-used 8 / CRF 20` | 最高吞吐，可接受更大文件 |
+| `speed`（默认） | `ultrafast / CRF 20 / 0 B 帧` | `realtime / cpu-used 8 / CRF 20` | 最高吞吐与低编码延迟，可接受更大文件 |
 | `balanced` | `superfast / CRF 20` | `good / cpu-used 6 / CRF 20` | 平衡速度与文件体积 |
 | `quality` | `fast / CRF 23 / tune fastdecode` | `good / cpu-used 4 / CRF 23` | 更注重压缩效率 |
+
+WebM/VP9 会根据输出分辨率和可用 CPU 自动设置编码线程与 tile 分块；`speed` 模式同时关闭 lookahead，减少短视频和预览转换的收尾等待。
 
 在 120 帧、1920×1080 彩色 ASCII 样本上，默认模式的流水线由旧参数的 72.6 FPS 提升至 92.4 FPS；H.264 子阶段由约 1.99 ms/帧降至 0.96 ms/帧。相同样本的隔离编码测试中，默认模式相对旧参数的综合 SSIM 为 0.9911（旧参数对照为 0.9919），PSNR 为 41.76 dB（旧参数对照为 40.20 dB）。默认模式样本文件为 10.62 MB，`balanced` 为 7.99 MB，`quality` 为 4.66 MB。测试结果取决于源编码、分辨率、ASCII 网格、字体、CPU 和 FFmpeg 构建，请在目标机器上使用同一输入进行比较，不把单台机器的结果视为通用保证。
 

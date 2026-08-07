@@ -38,7 +38,10 @@ public sealed record MediaOutputProfile(
             string tune = string.IsNullOrEmpty(settings.Tune)
                 ? string.Empty
                 : $" · tune {settings.Tune}";
-            return $"{settings.Preset} · CRF {settings.Crf}{tune}";
+            string bFrames = settings.MaxBFrames == 0
+                ? " · 0 B 帧"
+                : string.Empty;
+            return $"{settings.Preset} · CRF {settings.Crf}{tune}{bFrames}";
         }
 
         string deadline = string.Equals(settings.Mode, "speed", StringComparison.Ordinal)

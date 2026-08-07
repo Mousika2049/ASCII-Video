@@ -45,6 +45,12 @@ public interface IVideoEncoder : IDisposable
     void Finish();
 }
 
+/// <summary>可直接编码连续平面 YUV420P 帧的编码器能力。</summary>
+public interface IYuv420pVideoEncoder
+{
+    void EncodeYuv420pFrame(byte[] yuvData);
+}
+
 /// <summary>可选的编码器内部性能指标。</summary>
 public interface IVideoEncoderMetrics
 {

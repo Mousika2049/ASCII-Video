@@ -9,6 +9,8 @@ public sealed record VideoEncoderSettings(
     int Crf,
     string? Tune)
 {
+    public int MaxBFrames { get; init; } = 2;
+
     /// <summary>折中模式：视觉质量达标，同时控制文件体积。</summary>
     public static VideoEncoderSettings Balanced { get; } = new(
         "balanced",
@@ -28,7 +30,10 @@ public sealed record VideoEncoderSettings(
         "speed",
         "ultrafast",
         20,
-        null);
+        null)
+    {
+        MaxBFrames = 0
+    };
 
     public static VideoEncoderSettings FromMode(string mode)
     {

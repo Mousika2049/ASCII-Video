@@ -181,7 +181,7 @@ class Program
         Console.WriteLine($"  灰度/颜色映射   {stats.MappingTimeMs / totalFrames,7:F2} ms");
         Console.WriteLine($"  字符渲染        {stats.RenderTimeMs / totalFrames,7:F2} ms");
         Console.WriteLine($"  编码总计        {stats.EncodeTimeMs / totalFrames,7:F2} ms");
-        Console.WriteLine($"    RGB → YUV     {stats.ColorConversionTimeMs / totalFrames,7:F2} ms");
+        Console.WriteLine($"    YUV 帧装载      {stats.ColorConversionTimeMs / totalFrames,7:F2} ms");
         Console.WriteLine($"    {videoCodecDisplayName,-15}{stats.CodecTimeMs / totalFrames,7:F2} ms");
         Console.WriteLine($"    视频封装       {stats.MuxTimeMs / totalFrames,7:F2} ms");
         Console.WriteLine($"  编码收尾        {stats.EncoderFinishTimeMs,7:F2} ms");

@@ -44,3 +44,9 @@ public interface IAsciiRenderer : IDisposable
     /// <returns>RGB24 字节数组</returns>
     byte[] RenderFrameWithColor(string asciiArt, (byte R, byte G, byte B)[] colors, bool useColor = true);
 }
+
+/// <summary>可直接写入连续平面 YUV420P 的渲染器能力。</summary>
+public interface IYuv420pAsciiRenderer
+{
+    void RenderFrameYuv420p(AsciiFrame frame, byte[] destination, bool useColor = true);
+}
