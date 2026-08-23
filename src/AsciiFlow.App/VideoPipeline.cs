@@ -43,6 +43,7 @@ public class VideoPipeline : IDisposable
     private string? _finalOutputPath;
     private string? _stagingOutputPath;
     private bool _outputCommitted;
+    private long? _estimatedFrameCount;
 
     private bool _disposed = false;
 
@@ -116,6 +117,7 @@ public class VideoPipeline : IDisposable
         }
 
         var videoInfo = _decoder.GetVideoInfo();
+        _estimatedFrameCount = videoInfo.EstimatedFrameCount;
         int srcWidth = videoInfo.Width;
         int srcHeight = videoInfo.Height;
 
@@ -201,7 +203,9 @@ public class VideoPipeline : IDisposable
             _encoder.Initialize(_stagingOutputPath, _videoWidth, _videoHeight, outputFrameRate);
         }
 
-        string frameCountText = videoInfo.FrameCount > 0 ? $"{videoInfo.FrameCount} 帧" : "帧数未知";
+        string frameCountText = TerminalDisplay.FormatSourceFrameCount(
+            videoInfo.FrameCount,
+            _estimatedFrameCount);
         Console.WriteLine($"源视频  {videoInfo.Resolution} · {videoInfo.FrameRate:F3} FPS · {frameCountText}");
         Console.WriteLine(
             $"输出    {_videoWidth}x{_videoHeight} · ASCII {_asciiWidth}x{_asciiHeight} · " +
@@ -237,9 +241,10 @@ public class VideoPipeline : IDisposable
 
         int totalFrames = 0;
         int? maxFrames = request.MaxFrames > 0 ? request.MaxFrames : null;
-        long? estimatedTotalFrames = maxFrames.HasValue
+        bool progressTotalIsEstimated = !maxFrames.HasValue && _decoder.FrameCount <= 0 && _estimatedFrameCount.HasValue;
+        long? progressTotalFrames = maxFrames.HasValue
             ? maxFrames.Value
-            : (_decoder.FrameCount > 0 ? _decoder.FrameCount : null);
+            : _decoder.FrameCount > 0 ? _decoder.FrameCount : _estimatedFrameCount;
 
         int srcWidth = _decoder.Width;   // 原始视频宽度（如 1280）
         int srcHeight = _decoder.Height; // 原始视频高度（如 720）
@@ -415,18 +420,12 @@ public class VideoPipeline : IDisposable
             int framesThisSec = totalFrames - lastProgress;
             lastProgress = totalFrames;
 
-            double progress = estimatedTotalFrames > 0
-                ? Math.Min(100, (double)totalFrames / estimatedTotalFrames.Value * 100)
-                : 0;
             double fps = framesThisSec / elapsedSeconds;
-
-            const int barWidth = 30;
-            int filled = (int)(progress / 100 * barWidth);
-            string bar = new string('█', filled) + new string('░', barWidth - filled);
-            string progressLine =
-                $"处理    [{bar}] {progress,5:F1}% · " +
-                $"{totalFrames}/{(estimatedTotalFrames > 0 ? estimatedTotalFrames.ToString() : "?")} 帧 · " +
-                $"{fps:F0} FPS";
+            string progressLine = TerminalDisplay.FormatProgress(
+                totalFrames,
+                progressTotalFrames,
+                progressTotalIsEstimated,
+                fps);
             Console.Write($"\r{progressLine.PadRight(lastProgressLineLength)}");
             lastProgressLineLength = Math.Max(lastProgressLineLength, progressLine.Length);
         }

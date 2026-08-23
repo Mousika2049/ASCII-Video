@@ -26,6 +26,8 @@
   内置 Windows / Linux / macOS 自动字体选择降级机制（Consolas ➔ Cascadia Mono ➔ DejaVu Sans Mono ➔ Liberation Mono ➔ Monospace），防止跨平台全黑画面。
 - ⏱️ **智能帧率匹配（Auto Frame Rate）**
   使用有理数保留 `30000/1001`、`24000/1001` 等小数帧率，避免整数截断造成的累计漂移。
+- 📈 **可信的进度语义**
+  优先使用媒体提供的总帧数；缺少该元数据时，以时长和平均帧率显示明确标注为“约”的估算进度，完成摘要始终报告实际处理帧数。
 - 🛡️ **安全输出**
   先写入同目录临时文件，成功完成容器尾部后再替换目标；失败或取消不会破坏旧输出。
 
@@ -107,6 +109,15 @@ dotnet run --project src/AsciiFlow.App -- -i input.mp4 -o output.mp4 --max-frame
 
 ---
 
+## 🧭 运行行为说明
+
+- 输入与输出不能是同一路径。输出先写入目标目录中的临时文件，只有编码和容器收尾全部成功后才替换目标文件。
+- 音频仅在源编码与目标容器确认兼容时原样透传；例如 WebM 不接受 AAC 时会保留视频转换结果并忽略不兼容音轨，`--verbose` 会显示判断结果。
+- 源媒体没有 `nb_frames` 时，总帧数保持“未知”。界面只使用 `时长 × 平均帧率` 生成标有“约”的进度参考，并将其最高限制为 `99.9%`；完成摘要使用实际解码并编码的帧数。
+- `--max-frames` 是处理上限，适合快速预览。使用 `--no-progress` 可关闭动态进度；标准输出被重定向时也会自动关闭。
+
+---
+
 ## 📊 性能测量
 
 默认终端只显示输入、输出、核心配置、源视频信息、进度和完成摘要。使用 `--verbose` 时，额外显示容器、编码器、音轨状态以及各处理阶段的实际耗时。
@@ -138,10 +149,18 @@ AsciiFlow/
 │       ├── Rendering/             # SkiaSharp 字符位图渲染引擎
 │       └── Encoding/              # FFmpeg 容器选择与 H.264/VP9 编码
 ├── tests/
-│   └── AsciiFlow.Core.Tests/      # 映射、渲染、灰度和帧率测试
+│   └── AsciiFlow.Core.Tests/      # 核心逻辑、CLI、终端输出与并发流水线测试
 ├── ffmpeg/                        # FFmpeg 原生动态库
 ├── output/                        # 默认输出目录
 └── README.md                      # 项目说明文档
+```
+
+提交改动前可运行与 CI 一致的检查：
+
+```bash
+dotnet format AsciiFlow.slnx --verify-no-changes --no-restore
+dotnet build AsciiFlow.slnx -c Release --no-restore
+dotnet test AsciiFlow.slnx -c Release --no-build --no-restore
 ```
 
 ---

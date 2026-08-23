@@ -20,4 +20,42 @@ public class VideoFrameRateTests
     {
         Assert.Equal(new VideoFrameRate(30000, 1001), new VideoFrameRate(60000, 2002).Reduce());
     }
+
+    [Fact]
+    public void VideoInfo_EstimatesFrameCountWithoutOverwritingAuthoritativeCount()
+    {
+        var info = new VideoInfo(
+            3840,
+            2160,
+            new VideoFrameRate(24, 1),
+            frameCount: 0,
+            durationSeconds: 216.402);
+
+        Assert.Equal(0, info.FrameCount);
+        Assert.Equal(5194, info.EstimatedFrameCount);
+        Assert.Equal(216.402, info.DurationSeconds);
+    }
+
+    [Fact]
+    public void VideoInfo_DoesNotEstimateWhenAuthoritativeFrameCountExists()
+    {
+        var info = new VideoInfo(
+            1920,
+            1080,
+            new VideoFrameRate(30, 1),
+            frameCount: 300,
+            durationSeconds: 10.1);
+
+        Assert.Equal(300, info.FrameCount);
+        Assert.Null(info.EstimatedFrameCount);
+    }
+
+    [Fact]
+    public void VideoInfo_LeavesFrameCountUnknownWithoutDuration()
+    {
+        var info = new VideoInfo(1920, 1080, new VideoFrameRate(30, 1), frameCount: 0);
+
+        Assert.Equal(0, info.FrameCount);
+        Assert.Null(info.EstimatedFrameCount);
+    }
 }

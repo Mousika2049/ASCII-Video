@@ -73,6 +73,25 @@ public class VideoInfo
     /// <summary>视频时长（秒）</summary>
     public double DurationSeconds { get; set; }
 
+    /// <summary>
+    /// 仅在缺少权威总帧数时，根据媒体时长和平均帧率计算的近似值。
+    /// 该值不得用于覆盖 <see cref="FrameCount"/>。
+    /// </summary>
+    public long? EstimatedFrameCount
+    {
+        get
+        {
+            if (FrameCount > 0 || DurationSeconds <= 0 || FrameRate <= 0)
+                return null;
+
+            double estimate = DurationSeconds * FrameRate;
+            if (!double.IsFinite(estimate) || estimate < 1 || estimate > long.MaxValue)
+                return null;
+
+            return (long)Math.Round(estimate, MidpointRounding.AwayFromZero);
+        }
+    }
+
     /// <summary>视频编码格式</summary>
     public string CodecName { get; set; } = string.Empty;
 
@@ -98,7 +117,8 @@ public class VideoInfo
         VideoFrameRate frameRate,
         long frameCount,
         string codecName = "",
-        string pixelFormat = "")
+        string pixelFormat = "",
+        double durationSeconds = 0)
     {
         Width = width;
         Height = height;
@@ -107,11 +127,27 @@ public class VideoInfo
         FrameCount = frameCount;
         CodecName = codecName;
         PixelFormat = pixelFormat;
-        DurationSeconds = FrameRate > 0 && frameCount > 0 ? frameCount / FrameRate : 0;
+        DurationSeconds = durationSeconds > 0
+            ? durationSeconds
+            : FrameRate > 0 && frameCount > 0 ? frameCount / FrameRate : 0;
     }
 
-    public VideoInfo(int width, int height, double frameRate, long frameCount, string codecName = "", string pixelFormat = "")
-        : this(width, height, VideoFrameRate.FromDouble(frameRate), frameCount, codecName, pixelFormat)
+    public VideoInfo(
+        int width,
+        int height,
+        double frameRate,
+        long frameCount,
+        string codecName = "",
+        string pixelFormat = "",
+        double durationSeconds = 0)
+        : this(
+            width,
+            height,
+            VideoFrameRate.FromDouble(frameRate),
+            frameCount,
+            codecName,
+            pixelFormat,
+            durationSeconds)
     {
     }
 

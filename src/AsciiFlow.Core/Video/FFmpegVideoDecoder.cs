@@ -23,6 +23,7 @@ public unsafe class FFmpegVideoDecoder : IVideoDecoder
     private double _frameRate;
     private VideoFrameRate _exactFrameRate;
     private long _frameCount;
+    private double _durationSeconds;
     private long _currentFrame;
     private bool _initialized;
     private bool _disposed;
@@ -130,6 +131,8 @@ public unsafe class FFmpegVideoDecoder : IVideoDecoder
                 _frameCount = videoStream->nb_frames;
             else
                 _frameCount = 0;
+
+            _durationSeconds = ResolveDurationSeconds(_formatContext, videoStream);
 
             // ===== 分配帧和包 =====
             _frame = ffmpeg.av_frame_alloc();
@@ -409,7 +412,33 @@ public unsafe class FFmpegVideoDecoder : IVideoDecoder
             ? ffmpeg.av_get_pix_fmt_name(_codecContext->pix_fmt).ToString()
             : "unknown";
 
-        return new VideoInfo(_width, _height, _exactFrameRate, _frameCount, codecName, pixelFormat);
+        return new VideoInfo(
+            _width,
+            _height,
+            _exactFrameRate,
+            _frameCount,
+            codecName,
+            pixelFormat,
+            _durationSeconds);
+    }
+
+    private static double ResolveDurationSeconds(AVFormatContext* formatContext, AVStream* videoStream)
+    {
+        if (videoStream->duration > 0 && videoStream->duration != ffmpeg.AV_NOPTS_VALUE)
+        {
+            double streamDuration = videoStream->duration * ffmpeg.av_q2d(videoStream->time_base);
+            if (double.IsFinite(streamDuration) && streamDuration > 0)
+                return streamDuration;
+        }
+
+        if (formatContext->duration > 0 && formatContext->duration != ffmpeg.AV_NOPTS_VALUE)
+        {
+            double containerDuration = formatContext->duration / (double)ffmpeg.AV_TIME_BASE;
+            if (double.IsFinite(containerDuration) && containerDuration > 0)
+                return containerDuration;
+        }
+
+        return 0;
     }
 
     public void Reset()
@@ -462,6 +491,7 @@ public unsafe class FFmpegVideoDecoder : IVideoDecoder
         _initialized = false;
         _inFlushMode = false;
         _packetPending = false;
+        _durationSeconds = 0;
     }
 
     public void Dispose()
