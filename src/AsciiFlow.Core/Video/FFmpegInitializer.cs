@@ -49,8 +49,7 @@ public static class FFmpegInitializer
 
             try
             {
-                // FFmpeg.AutoGen 8.1.0 使用静态类初始化
-                // 通过访问任意方法触发初始化
+                // FFmpeg.AutoGen 通过访问任意原生方法触发静态绑定初始化。
                 _ = ffmpeg.av_version_info();
 
                 _initialized = true;
@@ -66,9 +65,9 @@ public static class FFmpegInitializer
                 // "Specified method is not supported" 通常是 ABI 版本不匹配
                 throw new NotSupportedException(
                     $"FFmpeg ABI 不兼容：{ex.Message}\n\n" +
-                    "可能原因：FFmpeg.AutoGen 8.1.0 需要兼容的 FFmpeg 8.x 动态库。\n" +
-                    "请确认您的 FFmpeg 库版本与 FFmpeg.AutoGen 版本匹配。\n\n" +
-                    "检查系统 FFmpeg 版本: ffmpeg -version\n" +
+                    "可能原因：FFmpeg.AutoGen 9.0.1 与当前加载的 FFmpeg 共享库 ABI 不匹配。\n" +
+                    "请确认绑定与整套 libav* 共享库来自兼容版本。\n\n" +
+                    "注意：ffmpeg -version 只显示命令行程序版本，不保证应用加载的是同一套共享库。\n" +
                     FFmpegPathResolver.GetHelpMessage(), ex);
             }
         }

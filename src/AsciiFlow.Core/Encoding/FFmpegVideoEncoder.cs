@@ -7,7 +7,7 @@ using FFmpeg.AutoGen;
 namespace AsciiFlow.Core.Encoding;
 
 /// <summary>
-/// 基于 FFmpeg.AutoGen 8.1.0 的多容器视频编码器。
+/// 基于 FFmpeg.AutoGen 的多容器视频编码器。
 /// 根据输出扩展名选择容器，WebM 使用 VP9，其他受支持容器使用 H.264。
 /// </summary>
 public unsafe class FFmpegVideoEncoder : IVideoEncoder, IYuv420pVideoEncoder, IVideoEncoderMetrics

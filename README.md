@@ -38,19 +38,29 @@
 ```mermaid
 flowchart LR
     A[📹 输入视频] --> B[1. FFmpeg 解码 RGB24]
-    B -->|3 槽有界缓冲| C[2. BT.709 / 颜色采样 / S-Curve ASCII 融合映射]
+    B -->|复用帧槽| C[2. BT.709 / 颜色采样 / S-Curve ASCII 融合映射]
     C --> D[3. 字符多线程直接渲染 YUV420P]
-    D -->|3 槽有界缓冲| E[4. H.264 / VP9 直接编码 + 兼容音轨透传]
+    D -->|复用帧槽| E[4. H.264 / VP9 直接编码 + 兼容音轨透传]
     E --> F[🎬 最终 ASCII 视频]
 ```
+
+流水线的职责边界、并发与内存上界、帧率/帧数语义以及安全输出流程，详见
+[架构说明](docs/architecture.md)。
 
 ---
 
 ## 🚀 快速开始
 
 ### 依赖环境
-- **[.NET 10.0 SDK](https://dotnet.microsoft.com/)** 或更高版本
-- **FFmpeg 8.x** 动态链接库（已内置 Linux 64位库）
+
+- **[.NET 10.0 SDK](https://dotnet.microsoft.com/)**；项目目标框架为 `net10.0`
+- 与 `FFmpeg.AutoGen 9.0.1` 匹配的 **FFmpeg 9 共享库**
+- FFmpeg 构建必须包含 `libx264`；若要输出 WebM，还必须包含 `libvpx-vp9`
+
+仓库中的 Linux x64 库可用于当前开发布局。Windows 和 macOS 运行时需要自行提供
+对应平台、对应 ABI 且包含所需编码器的共享库。AsciiFlow 通过 FFmpeg.AutoGen
+在进程内加载 `libav*`，不是调用系统中的 `ffmpeg` 命令行程序；只有安装
+`ffmpeg` 可执行文件并不保证应用能够启动或编码。
 
 ### 构建项目
 
@@ -64,6 +74,28 @@ dotnet build AsciiFlow.slnx -c Release
 # 运行单元测试
 dotnet test AsciiFlow.slnx -c Release
 ```
+
+### 配置 FFmpeg 共享库
+
+应用按以下顺序查找原生库：
+
+1. `FFMPEG_ROOT` 指向的目录；
+2. 应用目录下的 `ffmpeg/{linux|windows|macos}/`；
+3. 项目根目录下的同名平台目录；
+4. 当前工作目录下的同名平台目录；
+5. 最后由操作系统的动态链接器按其默认搜索规则解析。
+
+`FFMPEG_ROOT` 必须直接指向包含 `libavcodec`、`libavformat`、`libavutil` 和
+`libswscale` 等共享库的目录，而不是 `ffmpeg` 可执行文件。示例：
+
+```bash
+FFMPEG_ROOT=/opt/ffmpeg-9/lib \
+  dotnet run --project src/AsciiFlow.App -- -i input.mp4 -o output.mp4
+```
+
+不要混用不同 FFmpeg 主版本的库，也不要只替换单个 `libav*` 文件。绑定、所有
+相互依赖的共享库及编码器插件必须来自同一套构建；可用 `--verbose` 查看实际解析到
+的库目录、输出容器、编码器与音轨处理结果。
 
 ### 基础使用
 
@@ -107,6 +139,11 @@ dotnet run --project src/AsciiFlow.App -- -i input.mp4 -o output.mp4 --max-frame
 | | `--no-progress` | `false` | 禁用动态进度条（输出重定向时会自动禁用） |
 | `-v` | `--verbose` | `false` | 显示编码、渲染、性能明细和完整错误诊断 |
 
+参数边界：宽度为 `1..8192`，高度为 `0..8192`，帧率为 `0..1000`，字体大小
+为 `(0, 512]`，`--max-frames` 不能为负数；ASCII 网格最多 400 万个单元格。
+当请求的网格宽高超过源视频时会自动收缩，输出像素尺寸则保持源视频尺寸（奇数边长
+会补到相邻偶数，以满足 YUV420P 编码要求）。
+
 ---
 
 ## 🧭 运行行为说明
@@ -115,6 +152,7 @@ dotnet run --project src/AsciiFlow.App -- -i input.mp4 -o output.mp4 --max-frame
 - 音频仅在源编码与目标容器确认兼容时原样透传；例如 WebM 不接受 AAC 时会保留视频转换结果并忽略不兼容音轨，`--verbose` 会显示判断结果。
 - 源媒体没有 `nb_frames` 时，总帧数保持“未知”。界面只使用 `时长 × 平均帧率` 生成标有“约”的进度参考，并将其最高限制为 `99.9%`；完成摘要使用实际解码并编码的帧数。
 - `--max-frames` 是处理上限，适合快速预览。使用 `--no-progress` 可关闭动态进度；标准输出被重定向时也会自动关闭。
+- 按 `Ctrl+C` 会请求取消并返回退出码 `130`；参数解析失败返回 `2`，运行或编码失败返回 `1`，成功返回 `0`。
 
 ---
 
@@ -163,8 +201,13 @@ dotnet build AsciiFlow.slnx -c Release --no-restore
 dotnet test AsciiFlow.slnx -c Release --no-build --no-restore
 ```
 
+其中 CI 会执行还原、Release 构建和测试；`dotnet format` 是提交前的本地附加检查。
+
 ---
 
 ## 📄 开源协议
 
-本项目基于 [MIT License](LICENSE) 协议开源。
+AsciiFlow 自有源码基于 [MIT License](LICENSE) 开源。NuGet 依赖和 FFmpeg 原生库
+保留各自的许可证；仓库的 MIT 许可证不会覆盖这些第三方组件。当前 H.264 输出依赖
+`libx264`，分发应用或原生库前，请根据实际 FFmpeg 构建配置核对并随发行物提供相应
+许可证、声明及源码提供方式。本文不是法律意见。

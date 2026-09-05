@@ -164,19 +164,18 @@ public static class FFmpegPathResolver
 │    AsciiFlow/                                                  │
 │    └── ffmpeg/                                                 │
 │        └── {(RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? "windows/" : RuntimeInformation.IsOSPlatform(OSPlatform.OSX) ? "macos/  " : "linux/   ")}                                         │
-│            ├─ {(RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? "avcodec-62.dll" : "libavcodec.so.*"),-50} │
-│            ├─ {(RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? "avformat-62.dll" : "libavformat.so.*"),-50} │
+│            ├─ {(RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? "avcodec-63.dll" : "libavcodec.so.*"),-50} │
+│            ├─ {(RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? "avformat-63.dll" : "libavformat.so.*"),-50} │
 │            └─ ...                                              │
 │                                                                │
 │  解决方式:                                                      │
 │    1. 将 FFmpeg 库文件放入项目根目录下的 ffmpeg/{(RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? "windows" : RuntimeInformation.IsOSPlatform(OSPlatform.OSX) ? "macos" : "linux")}/ 文件夹 │
 │    2. 设置环境变量 FFMPEG_ROOT=/path/to/ffmpeg                 │
-│    3. 将 FFmpeg 库所在目录加入系统 PATH                        │
+│    3. 将 FFmpeg 共享库目录加入系统动态链接器搜索路径             │
 │                                                                │
 │  获取 FFmpeg:                                                  │
 │    Windows: https://www.gyan.dev/ffmpeg/builds/                │
-│    Linux:   sudo apt install libavcodec-dev libavformat-dev ... │
-│    macOS:   brew install ffmpeg                                │
+│    Linux/macOS: 安装与 FFmpeg.AutoGen 兼容且含所需编码器的共享库 │
 │                                                                │
 └────────────────────────────────────────────────────────────────┘
 ";

@@ -6,7 +6,7 @@ using FFmpeg.AutoGen;
 namespace AsciiFlow.Core.Video;
 
 /// <summary>
-/// 基于 FFmpeg.AutoGen 8.1.0 的高性能视频解码器
+/// 基于 FFmpeg.AutoGen 的高性能视频解码器
 /// 修复版本：正确处理 H.264 B 帧延迟，修复所有编译错误
 /// </summary>
 public unsafe class FFmpegVideoDecoder : IVideoDecoder
